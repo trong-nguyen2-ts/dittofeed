@@ -17,6 +17,7 @@ import {
 } from "./types";
 
 const BaseRawConfigProps = {
+  // original config
   databaseUrl: Type.Optional(Type.String()),
   databaseUser: Type.Optional(Type.String()),
   databasePassword: Type.Optional(Type.String()),
@@ -124,6 +125,10 @@ const BaseRawConfigProps = {
   enableAdditionalDashboardSettings: Type.Optional(BoolStr),
   additionalDashboardSettingsPath: Type.Optional(Type.String()),
   additionalDashboardSettingsTitle: Type.Optional(Type.String()),
+
+  // TS custom config
+  clickhouseClientRequestTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
+  workflowTaskTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
 };
 
 function defaultTemporalAddress(inputURL?: string): string {
@@ -244,6 +249,10 @@ export type Config = Overwrite<
     computePropertiesQueueCapacity: number;
     computePropertiesSchedulerInterval: number;
     enableAdditionalDashboardSettings: boolean;
+
+    // TS custom config
+    clickhouseClientRequestTimeout?: number;
+    workflowTaskTimeout?: number;
   }
 > & {
   defaultUserEventsTableVersion: string;
@@ -555,6 +564,12 @@ function parseRawConfig(rawConfig: RawConfig): Config {
         : 10 * 1000,
     enableAdditionalDashboardSettings:
       rawConfig.enableAdditionalDashboardSettings === "true",
+
+    // TS custom config
+    clickhouseClientRequestTimeout: rawConfig.clickhouseClientRequestTimeout
+      ? parseInt(rawConfig.clickhouseClientRequestTimeout)
+      : 30_000,
+    workflowTaskTimeout: rawConfig.workflowTaskTimeout ? parseInt(rawConfig.workflowTaskTimeout) : 10 * 1000,
   };
 
   return parsedConfig;

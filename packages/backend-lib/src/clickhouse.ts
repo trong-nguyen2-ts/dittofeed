@@ -114,6 +114,7 @@ function getClientConfig({
     clickhouseDatabase: database,
     clickhouseUser: username,
     clickhousePassword: password,
+    clickhouseClientRequestTimeout: request_timeout,
   } = config();
 
   const clientConfig: NodeClickHouseClientConfigOptions = {
@@ -121,6 +122,7 @@ function getClientConfig({
     database,
     username,
     password,
+    request_timeout: request_timeout,
     clickhouse_settings: {
       date_time_input_format: "best_effort",
     },

@@ -17,7 +17,7 @@ const { defaultWorkerLogger: logger } = proxySinks<LoggerSinks>();
 const { getOauthToken, refreshToken, getIntegrationEnabled } = proxyActivities<
   typeof activities
 >({
-  startToCloseTimeout: "5 minutes",
+  startToCloseTimeout: "30 minutes",
 });
 
 export const hubspotWorkflowInitialize = wf.defineSignal(

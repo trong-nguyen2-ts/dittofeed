@@ -57,7 +57,7 @@ const {
   getWorkspace,
   shouldReEnter,
 } = proxyActivities<typeof activities>({
-  startToCloseTimeout: "2 minutes",
+  startToCloseTimeout: "30 minutes",
 });
 
 type SegmentAssignment = Pick<
@@ -592,11 +592,11 @@ export async function userJourneyWorkflow(
             }
 
             const smsVariant: RenameKey<SmsMessageVariant, "type", "channel"> =
-              {
-                ...smsProviderOverride,
-                templateId: currentNode.variant.templateId,
-                channel: currentNode.variant.type,
-              };
+            {
+              ...smsProviderOverride,
+              templateId: currentNode.variant.templateId,
+              channel: currentNode.variant.type,
+            };
             variant = smsVariant;
             break;
           }
