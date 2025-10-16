@@ -1,14 +1,9 @@
 import { proxyActivities } from "@temporalio/workflow";
 
 import type * as activities from "./temporal/activities";
-import config from "./config";
-
-const {
-  globalCronWorkflowStartToCloseTimeout
-} = config();
 
 const { emitGlobalSignals } = proxyActivities<typeof activities>({
-  startToCloseTimeout: globalCronWorkflowStartToCloseTimeout,
+  startToCloseTimeout: "30 minutes",
 });
 
 export const GLOBAL_CRON_ID = "global-cron-workflow";

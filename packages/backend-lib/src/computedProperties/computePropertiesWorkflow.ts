@@ -11,20 +11,15 @@ import * as wf from "@temporalio/workflow";
 // Only import the activity types
 import type * as activities from "../temporal/activities";
 import { EnrichedJourney } from "../types";
-import { default as configEnv } from "../config";
 
 const { defaultWorkerLogger: logger } = proxySinks<LoggerSinks>();
-
-const {
-  computePropertiesStartToCloseTimeout
-} = configEnv();
 
 const {
   computePropertiesIncremental,
   computePropertiesIncrementalArgs,
   config,
 } = proxyActivities<typeof activities>({
-  startToCloseTimeout: computePropertiesStartToCloseTimeout,
+  startToCloseTimeout: "30 minutes",
 });
 
 export const userJourneyInitialize = wf.defineSignal<[string]>(

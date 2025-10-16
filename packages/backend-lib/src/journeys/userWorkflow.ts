@@ -36,9 +36,6 @@ import {
 } from "../types";
 import * as activities from "./userWorkflow/activities";
 import { GetSegmentAssignmentVersion } from "./userWorkflow/types";
-import { default as configEnv } from "../config";
-
-const { userStartToCloseTimeout } = configEnv();
 
 const { defaultWorkerLogger: logger } = proxySinks<LoggerSinks>();
 
@@ -60,7 +57,7 @@ const {
   getWorkspace,
   shouldReEnter,
 } = proxyActivities<typeof activities>({
-  startToCloseTimeout: userStartToCloseTimeout,
+  startToCloseTimeout: "30 minutes",
 });
 
 type SegmentAssignment = Pick<

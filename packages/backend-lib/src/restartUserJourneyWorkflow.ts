@@ -2,8 +2,6 @@ import { proxyActivities } from "@temporalio/workflow";
 
 // Only import the activity types
 import type * as activities from "./temporal/activities";
-import config from "./config";
-
 export interface RestartUserJourneyWorkflowProps {
   workspaceId: string;
   journeyId: string;
@@ -17,12 +15,8 @@ export function generateRestartUserJourneysWorkflowId({
   return `restart-user-journeys-workflow-${workspaceId}-${journeyId}`;
 }
 
-const {
-  restartUserJourneysWorkflowStartToCloseTimeout
-} = config();
-
 const { restartUserJourneysActivity } = proxyActivities<typeof activities>({
-  startToCloseTimeout: restartUserJourneysWorkflowStartToCloseTimeout,
+  startToCloseTimeout: "30 minutes",
 });
 
 export async function restartUserJourneysWorkflow({

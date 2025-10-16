@@ -1,12 +1,9 @@
 import { proxyActivities } from "@temporalio/workflow";
 
 import * as activities from "./bootstrap/activities";
-import { default as configEnv } from "../config";
-
-const { bootstrapStartToCloseTimeout } = configEnv();
 
 const { bootstrap } = proxyActivities<typeof activities>({
-  startToCloseTimeout: bootstrapStartToCloseTimeout,
+  startToCloseTimeout: "30 minutes",
 });
 
 export async function bootstrapWorkflow(
