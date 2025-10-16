@@ -122,7 +122,7 @@ function getClientConfig({
     database,
     username,
     password,
-    request_timeout: request_timeout ?? 30_000,
+    request_timeout: request_timeout,
     clickhouse_settings: {
       date_time_input_format: "best_effort",
     },

@@ -603,7 +603,7 @@ function parseRawConfig(rawConfig: RawConfig): Config {
     hubspotStartToCloseTimeout: rawConfig.hubspotStartToCloseTimeout ? parseInt(rawConfig.hubspotStartToCloseTimeout) : 5 * 60 * 1000,
     bootstrapStartToCloseTimeout: rawConfig.bootstrapStartToCloseTimeout ? parseInt(rawConfig.bootstrapStartToCloseTimeout) : 2 * 60 * 1000,
     userStartToCloseTimeout: rawConfig.userStartToCloseTimeout ? parseInt(rawConfig.userStartToCloseTimeout) : 2 * 60 * 1000,
-    workflowTaskTimeout: rawConfig.workflowTaskTimeout ? parseInt(rawConfig.workflowTaskTimeout) : 60 * 1000,
+    workflowTaskTimeout: rawConfig.workflowTaskTimeout ? parseInt(rawConfig.workflowTaskTimeout) : 10 * 1000,
   };
 
   return parsedConfig;
