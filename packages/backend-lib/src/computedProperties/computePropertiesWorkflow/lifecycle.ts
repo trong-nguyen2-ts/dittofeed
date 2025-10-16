@@ -39,7 +39,7 @@ export async function startComputePropertiesWorkflow({
     await temporalClient.start(computePropertiesWorkflow, {
       taskQueue: config().computedPropertiesTaskQueue,
       workflowId: generateComputePropertiesId(workspaceId),
-      workflowTaskTimeout: workflowTaskTimeout,
+      workflowTaskTimeout: computePropertiesWorkflowTaskTimeout,
       args: [
         {
           tableVersion: defaultUserEventsTableVersion,
