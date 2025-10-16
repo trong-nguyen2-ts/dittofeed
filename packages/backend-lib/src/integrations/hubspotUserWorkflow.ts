@@ -14,6 +14,11 @@ import { Overwrite } from "utility-types";
 
 // Only import the activity types
 import type * as activities from "./hubspot/activities";
+import { default as configEnv } from "../config";
+
+const {
+  hubspotUserStartToCloseTimeout
+} = configEnv();
 
 const { defaultWorkerLogger: logger } = proxySinks<LoggerSinks>();
 
@@ -23,7 +28,7 @@ const {
   updateHubspotEmails,
   updateHubspotLists,
 } = proxyActivities<typeof activities>({
-  startToCloseTimeout: "5 minutes",
+  startToCloseTimeout: hubspotUserStartToCloseTimeout,
 });
 
 export const hubspotUserComputedProperties = wf.defineSignal<

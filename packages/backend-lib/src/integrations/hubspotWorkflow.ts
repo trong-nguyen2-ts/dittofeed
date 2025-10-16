@@ -11,13 +11,16 @@ import * as wf from "@temporalio/workflow";
 import { JsonResultType } from "../types";
 // Only import the activity types
 import type * as activities from "./hubspot/activities";
+import { default as configEnv } from "../config";
+
+const { hubspotStartToCloseTimeout } = configEnv();
 
 const { defaultWorkerLogger: logger } = proxySinks<LoggerSinks>();
 
 const { getOauthToken, refreshToken, getIntegrationEnabled } = proxyActivities<
   typeof activities
 >({
-  startToCloseTimeout: "5 minutes",
+  startToCloseTimeout: hubspotStartToCloseTimeout,
 });
 
 export const hubspotWorkflowInitialize = wf.defineSignal(

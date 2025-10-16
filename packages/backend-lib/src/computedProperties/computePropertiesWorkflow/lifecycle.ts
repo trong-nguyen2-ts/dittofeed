@@ -32,13 +32,14 @@ export async function startComputePropertiesWorkflow({
   const {
     computePropertiesWorkflowTaskTimeout,
     defaultUserEventsTableVersion,
+    workflowTaskTimeout,
   } = config();
 
   try {
     await temporalClient.start(computePropertiesWorkflow, {
       taskQueue: config().computedPropertiesTaskQueue,
       workflowId: generateComputePropertiesId(workspaceId),
-      workflowTaskTimeout: computePropertiesWorkflowTaskTimeout,
+      workflowTaskTimeout: workflowTaskTimeout,
       args: [
         {
           tableVersion: defaultUserEventsTableVersion,
@@ -65,11 +66,13 @@ export async function startGlobalCron({
   client?: WorkflowClient;
 } = {}) {
   const temporalClient = client ?? (await connectWorkflowClient());
+  const { workflowTaskTimeout } = config();
   try {
     await temporalClient.start(globalCronWorkflow, {
       taskQueue: config().globalCronTaskQueue,
       cronSchedule: "*/5 * * * *",
       workflowId: GLOBAL_CRON_ID,
+      workflowTaskTimeout: workflowTaskTimeout,
     });
   } catch (e) {
     if (e instanceof WorkflowExecutionAlreadyStartedError) {

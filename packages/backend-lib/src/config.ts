@@ -17,6 +17,7 @@ import {
 } from "./types";
 
 const BaseRawConfigProps = {
+  // original config
   databaseUrl: Type.Optional(Type.String()),
   databaseUser: Type.Optional(Type.String()),
   databasePassword: Type.Optional(Type.String()),
@@ -124,6 +125,21 @@ const BaseRawConfigProps = {
   enableAdditionalDashboardSettings: Type.Optional(BoolStr),
   additionalDashboardSettingsPath: Type.Optional(Type.String()),
   additionalDashboardSettingsTitle: Type.Optional(Type.String()),
+
+  // TS custom config
+  clickhouseClientRequestTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
+  globalCronWorkflowStartToCloseTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
+  restartUserJourneysWorkflowStartToCloseTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
+  broadcastWorkflowStartToCloseTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
+  computePropertiesQueueBaseStartToCloseTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
+  computePropertiesQueueStartToCloseTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
+  computePropertiesStartToCloseTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
+  computePropertiesSchedulerStartToCloseTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
+  hubspotUserStartToCloseTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
+  hubspotStartToCloseTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
+  bootstrapStartToCloseTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
+  userStartToCloseTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
+  workflowTaskTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
 };
 
 function defaultTemporalAddress(inputURL?: string): string {
@@ -244,6 +260,21 @@ export type Config = Overwrite<
     computePropertiesQueueCapacity: number;
     computePropertiesSchedulerInterval: number;
     enableAdditionalDashboardSettings: boolean;
+
+    // TS custom config
+    clickhouseClientRequestTimeout?: number;
+    globalCronWorkflowStartToCloseTimeout?: number;
+    restartUserJourneysWorkflowStartToCloseTimeout?: number;
+    broadcastWorkflowStartToCloseTimeout?: number;
+    computePropertiesQueueBaseStartToCloseTimeout?: number;
+    computePropertiesQueueStartToCloseTimeout?: number;
+    computePropertiesStartToCloseTimeout?: number;
+    computePropertiesSchedulerStartToCloseTimeout?: number;
+    hubspotUserStartToCloseTimeout?: number;
+    hubspotStartToCloseTimeout?: number;
+    bootstrapStartToCloseTimeout?: number;
+    userStartToCloseTimeout?: number;
+    workflowTaskTimeout?: number;
   }
 > & {
   defaultUserEventsTableVersion: string;
@@ -555,6 +586,24 @@ function parseRawConfig(rawConfig: RawConfig): Config {
         : 10 * 1000,
     enableAdditionalDashboardSettings:
       rawConfig.enableAdditionalDashboardSettings === "true",
+
+    // TS custom config
+    clickhouseClientRequestTimeout: rawConfig.clickhouseClientRequestTimeout
+      ? parseInt(rawConfig.clickhouseClientRequestTimeout)
+      : 30_000,
+
+    globalCronWorkflowStartToCloseTimeout: rawConfig.globalCronWorkflowStartToCloseTimeout ? parseInt(rawConfig.globalCronWorkflowStartToCloseTimeout) : 5 * 60 * 1000,
+    restartUserJourneysWorkflowStartToCloseTimeout: rawConfig.restartUserJourneysWorkflowStartToCloseTimeout ? parseInt(rawConfig.restartUserJourneysWorkflowStartToCloseTimeout) : 2 * 60 * 1000,
+    broadcastWorkflowStartToCloseTimeout: rawConfig.broadcastWorkflowStartToCloseTimeout ? parseInt(rawConfig.broadcastWorkflowStartToCloseTimeout) : 5 * 60 * 1000,
+    computePropertiesQueueBaseStartToCloseTimeout: rawConfig.computePropertiesQueueBaseStartToCloseTimeout ? parseInt(rawConfig.computePropertiesQueueBaseStartToCloseTimeout) : 1 * 60 * 1000,
+    computePropertiesQueueStartToCloseTimeout: rawConfig.computePropertiesQueueStartToCloseTimeout ? parseInt(rawConfig.computePropertiesQueueStartToCloseTimeout) : 5 * 60 * 1000,
+    computePropertiesStartToCloseTimeout: rawConfig.computePropertiesStartToCloseTimeout ? parseInt(rawConfig.computePropertiesStartToCloseTimeout) : 5 * 60 * 1000,
+    computePropertiesSchedulerStartToCloseTimeout: rawConfig.computePropertiesSchedulerStartToCloseTimeout ? parseInt(rawConfig.computePropertiesSchedulerStartToCloseTimeout) : 1 * 60 * 1000,
+    hubspotUserStartToCloseTimeout: rawConfig.hubspotUserStartToCloseTimeout ? parseInt(rawConfig.hubspotUserStartToCloseTimeout) : 5 * 60 * 1000,
+    hubspotStartToCloseTimeout: rawConfig.hubspotStartToCloseTimeout ? parseInt(rawConfig.hubspotStartToCloseTimeout) : 5 * 60 * 1000,
+    bootstrapStartToCloseTimeout: rawConfig.bootstrapStartToCloseTimeout ? parseInt(rawConfig.bootstrapStartToCloseTimeout) : 2 * 60 * 1000,
+    userStartToCloseTimeout: rawConfig.userStartToCloseTimeout ? parseInt(rawConfig.userStartToCloseTimeout) : 2 * 60 * 1000,
+    workflowTaskTimeout: rawConfig.workflowTaskTimeout ? parseInt(rawConfig.workflowTaskTimeout) : 60 * 1000,
   };
 
   return parsedConfig;

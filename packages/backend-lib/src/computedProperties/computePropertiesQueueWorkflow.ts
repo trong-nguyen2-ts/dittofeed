@@ -13,6 +13,8 @@ import {
 
 import type * as activities from "../temporal/activities";
 import { Semaphore } from "../temporal/semaphore";
+import { default as configEnv } from "../config";
+
 
 export const COMPUTE_PROPERTIES_QUEUE_WORKFLOW_ID =
   "compute-properties-queue-workflow";
@@ -25,11 +27,16 @@ export const addWorkspacesSignal = defineSignal<[string[]]>(
 
 export const getQueueSizeQuery = defineQuery<number>("getQueueSizeQuery");
 
+const {
+  computePropertiesQueueBaseStartToCloseTimeout,
+  computePropertiesQueueStartToCloseTimeout
+} = configEnv();
+
 /**
  * Activities
  */
 const { config } = proxyActivities<typeof activities>({
-  startToCloseTimeout: "1 minutes",
+  startToCloseTimeout: computePropertiesQueueBaseStartToCloseTimeout,
 });
 
 /**
@@ -75,7 +82,7 @@ export async function computePropertiesQueueWorkflow(
   const maxLoopIterations = initialConfig.computePropertiesAttempts;
 
   const { computePropertiesContained } = proxyActivities<typeof activities>({
-    startToCloseTimeout: "5 minutes",
+    startToCloseTimeout: computePropertiesQueueStartToCloseTimeout,
     taskQueue: initialConfig.computedPropertiesActivityTaskQueue,
   });
 

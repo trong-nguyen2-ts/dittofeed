@@ -7,6 +7,7 @@ import bootstrap, {
 } from "../../bootstrap";
 import connectWorkflowClient from "../../temporal/connectWorkflowClient";
 import { bootstrapWorkflow } from "../bootstrap";
+import config from "../../config";
 
 export function getBootstrapWorkflowId(
   params: Parameters<typeof bootstrap>[0],
@@ -23,11 +24,13 @@ export async function startBootstrapWorkflow(
   const paramsWithDefaults = getBootstrapDefaultParams(
     paramsWithoutClientOrDefaults,
   );
+  const { workflowTaskTimeout } = config();
   const temporalClient = client ?? (await connectWorkflowClient());
 
   try {
     await temporalClient.start(bootstrapWorkflow, {
       workflowId: getBootstrapWorkflowId(paramsWithDefaults),
+      workflowTaskTimeout: workflowTaskTimeout,
       args: [paramsWithDefaults],
       taskQueue: "default",
     });
