@@ -23,7 +23,7 @@ const {
   updateHubspotEmails,
   updateHubspotLists,
 } = proxyActivities<typeof activities>({
-  startToCloseTimeout: "5 minutes",
+  startToCloseTimeout: "30 minutes",
 });
 
 export const hubspotUserComputedProperties = wf.defineSignal<

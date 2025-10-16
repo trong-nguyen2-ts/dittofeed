@@ -4,7 +4,7 @@ import { proxyActivities } from "@temporalio/workflow";
 import type * as activities from "../temporal/activities";
 
 const { performBroadcastIncremental } = proxyActivities<typeof activities>({
-  startToCloseTimeout: "5 minutes",
+  startToCloseTimeout: "30 minutes",
 });
 
 export function generateBroadcastWorkflowId({

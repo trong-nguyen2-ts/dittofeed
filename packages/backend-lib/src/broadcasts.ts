@@ -35,6 +35,7 @@ import { toSegmentResource } from "./segments";
 import connectWorkflowClient from "./temporal/connectWorkflowClient";
 import { isAlreadyStartedError } from "./temporal/workflow";
 import { Broadcast } from "./types";
+import config from "./config";
 
 export function getBroadcastSegmentName({
   broadcastId,
@@ -355,6 +356,8 @@ export async function triggerBroadcast({
     return toBroadcastResource(broadcast);
   }
 
+  const { workflowTaskTimeout } = config();
+
   try {
     await temporalClient.start(broadcastWorkflow, {
       taskQueue: "default",
@@ -362,6 +365,7 @@ export async function triggerBroadcast({
         workspaceId,
         broadcastId,
       }),
+      workflowTaskTimeout:workflowTaskTimeout,
       args: [
         {
           workspaceId,

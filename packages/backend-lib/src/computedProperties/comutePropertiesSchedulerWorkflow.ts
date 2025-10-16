@@ -14,6 +14,7 @@ import { addWorkspacesSignal } from "./computePropertiesQueueWorkflow";
 
 const { defaultWorkerLogger: logger } = proxySinks<LoggerSinks>();
 
+
 export const COMPUTE_PROPERTIES_SCHEDULER_WORKFLOW_ID =
   "compute-properties-scheduler-workflow";
 
@@ -23,7 +24,7 @@ export const COMPUTE_PROPERTIES_SCHEDULER_WORKFLOW_ID =
 const { findDueWorkspaces, getQueueSize, config } = proxyActivities<
   typeof activities
 >({
-  startToCloseTimeout: "1 minute",
+  startToCloseTimeout: "30 minutes",
 });
 
 export interface ComputePropertiesSchedulerWorkflowParams {
