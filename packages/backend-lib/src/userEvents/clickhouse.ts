@@ -74,6 +74,36 @@ export const GROUP_MATERIALIZED_VIEWS = [
   `,
 ];
 
+export const USER_EVENT_METADATA_REFRESH_MATERIALIZED_VIEWS = [
+  `
+    CREATE MATERIALIZED VIEW IF NOT EXISTS user_event_identify_traits_metadata_refresh_mv
+    REFRESH EVERY 1 HOUR
+    ORDER BY (workspace_id, trait) AS
+    SELECT DISTINCT
+       workspace_id,
+       arrayJoin(JSONExtractKeys(properties)) AS trait
+     FROM user_events_v2
+     WHERE
+       event_type = 'identify'
+  `,
+  `
+    CREATE MATERIALIZED VIEW IF NOT EXISTS user_event_track_properties_metadata_refresh_mv
+    REFRESH EVERY 1 HOUR
+    ORDER BY (workspace_id, event, property) AS
+    SELECT
+      workspace_id,
+      arrayJoin(JSONExtractKeys(properties)) AS property,
+      event
+    FROM user_events_v2
+    WHERE
+      event_type = 'track'
+    GROUP BY
+      workspace_id,
+      property,
+      event
+  `,
+];
+
 // TODO route through kafka
 export async function insertProcessedComputedProperties({
   assignments,
@@ -391,6 +421,7 @@ export async function createUserEventsTables({
         computed_at;
     `,
     ...GROUP_MATERIALIZED_VIEWS,
+    ...USER_EVENT_METADATA_REFRESH_MATERIALIZED_VIEWS,
   ];
   if (ingressTopic && config().writeMode === "kafka") {
     mvQueries.push(`

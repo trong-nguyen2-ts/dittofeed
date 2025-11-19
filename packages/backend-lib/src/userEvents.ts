@@ -216,12 +216,11 @@ export async function findIdentifyTraits({
   workspaceId: string;
 }): Promise<string[]> {
   const query = `
-    SELECT DISTINCT
-      arrayJoin(JSONExtractKeys(properties)) AS trait
-    FROM user_events_v2
-    WHERE
+    SELECT 
+      *
+    FROM user_event_identify_traits_metadata_refresh_mv
+    WHERE 
       workspace_id = {workspaceId:String}
-      and event_type = 'identify'
   `;
 
   const resultSet = await chQuery({
@@ -245,15 +244,10 @@ export async function findTrackProperties({
   const workspaceIdParam = qb.addQueryValue(workspaceId, "String");
   const query = `
     SELECT
-      arrayJoin(JSONExtractKeys(properties)) AS property,
-      event
-    FROM user_events_v2
+      *
+    FROM user_event_track_properties_metadata_refresh_mv
     WHERE
       workspace_id = ${workspaceIdParam}
-      and event_type = 'track'
-    GROUP BY
-      property,
-      event
   `;
 
   const resultSet = await chQuery({
