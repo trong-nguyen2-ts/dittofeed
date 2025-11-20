@@ -9,7 +9,7 @@ jobs:
     name: Push Docker image to Docker Hub
     strategy:
       matrix:
-        package: [lite]
+        package: [worker, api, dashboard, admin-cli, lite]
 
     runs-on: ubuntu-latest
     steps:
@@ -49,7 +49,7 @@ jobs:
           context: .
           file: ./packages/${{ matrix.package }}/Dockerfile
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
