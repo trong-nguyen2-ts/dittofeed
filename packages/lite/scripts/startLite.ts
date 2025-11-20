@@ -70,7 +70,7 @@ async function startLite() {
     logger().info("Skipping bootstrap");
   }
 
-  const { port, host, nodeEnv } = liteConfig();
+  const { port, host, nodeEnv, mode } = liteConfig();
 
   const relativeDir = "dashboard";
   const packagesDir = findPackagesDir(__dirname);
@@ -105,11 +105,19 @@ async function startLite() {
     },
   });
 
-  const worker = await buildWorker(otel);
+  logger().info({ mode }, "Starting dittofeed");
+  if (mode === "api") {
+    await app.listen({ port, host });
+  } else if (mode === "worker") {
+    const worker = await buildWorker(otel);
+    otel.start();
+    await worker.run();
+  } else {
+    const worker = await buildWorker(otel);
+    otel.start();
+    await Promise.all([app.listen({ port, host }), worker.run()]);
+  }
 
-  otel.start();
-
-  await Promise.all([app.listen({ port, host }), worker.run()]);
 }
 
 startLite()

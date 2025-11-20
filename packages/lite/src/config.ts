@@ -12,6 +12,7 @@ const RawConfigProps = {
     }),
   ),
   host: Type.Optional(Type.String()),
+  mode: Type.Optional(Type.String({ default: "all" })),
 };
 
 // Structure of application config.
@@ -26,6 +27,7 @@ export type Config = Overwrite<
     serviceName: string;
     host: string;
     port: number;
+    mode: string;
   }
 >;
 function parseRawConfig(raw: RawConfig): Config {
@@ -38,6 +40,7 @@ function parseRawConfig(raw: RawConfig): Config {
     nodeEnv,
     host: raw.host ?? (nodeEnv === "development" ? "localhost" : "0.0.0.0"),
     port: Number.isNaN(port) ? 3000 : port,
+    mode: raw.mode ?? "all",
   };
 }
 
