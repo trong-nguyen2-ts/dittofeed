@@ -9,6 +9,7 @@ import {
   KeyboardDoubleArrowLeft,
   OpenInNew,
   Refresh as RefreshIcon,
+  Search as SearchIcon,
   Visibility as VisibilityIcon,
 } from "@mui/icons-material";
 import {
@@ -17,6 +18,7 @@ import {
   Divider,
   FormControl,
   IconButton,
+  InputAdornment,
   MenuItem,
   Paper,
   Popover,
@@ -30,6 +32,7 @@ import {
   TableFooter,
   TableHead,
   TableRow,
+  TextField,
   Tooltip,
   Typography,
 } from "@mui/material";
@@ -54,8 +57,9 @@ import {
   RelatedResourceProperties,
 } from "isomorphic-lib/src/types";
 import Link from "next/link";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { omit } from "remeda";
+import { useDebounce } from "use-debounce";
 import { Updater, useImmer } from "use-immer";
 import { v4 as uuid } from "uuid";
 
@@ -103,27 +107,27 @@ type TimeOption = MinuteTimeOption | CustomTimeOption;
 
 const defaultTimeOption = {
   type: "minutes",
-  id: "last-hour",
-  minutes: 60,
-  label: "Last hour",
+  id: "last-7-days",
+  minutes: 7 * 24 * 60,
+  label: "Last 7 days",
 } as const;
 
 const defaultTimeOptionId = defaultTimeOption.id;
 
 const timeOptions: TimeOption[] = [
-  defaultTimeOption,
+  {
+    type: "minutes",
+    id: "last-hour",
+    minutes: 60,
+    label: "Last hour",
+  },
   {
     type: "minutes",
     id: "last-24-hours",
     minutes: 24 * 60,
     label: "Last 24 hours",
   },
-  {
-    type: "minutes",
-    id: "last-7-days",
-    minutes: 7 * 24 * 60,
-    label: "Last 7 days",
-  },
+  defaultTimeOption, // Last 7 days (default)
   {
     type: "minutes",
     id: "last-30-days",
@@ -504,6 +508,18 @@ export function UserEventsTable({
     customDateRange: null,
   });
 
+  // Local search input state with debounce
+  const [searchInput, setSearchInput] = useState(initialSearchTerm ?? "");
+  const [debouncedSearchTerm] = useDebounce(searchInput, 300);
+
+  // Update query state when debounced search term changes
+  useEffect(() => {
+    setState((draft) => {
+      draft.query.searchTerm = debouncedSearchTerm || undefined;
+      draft.query.offset = 0;
+    });
+  }, [debouncedSearchTerm, setState]);
+
   const messages = useMemo(
     () =>
       messagesResult.type === CompletionStatus.Successful
@@ -695,6 +711,13 @@ export function UserEventsTable({
     [],
   );
 
+  const renderProcessingTimeCell = useCallback(
+    ({ row }: { row: Row<GetEventsResponseItem> }) => (
+      <TimeCell timestamp={row.original.processingTime} />
+    ),
+    [],
+  );
+
   const renderMessageIdCell = useCallback(
     // eslint-disable-next-line @typescript-eslint/no-unused-vars, react/no-unused-prop-types
     ({ row }: { row: Row<GetEventsResponseItem> }) => (
@@ -740,6 +763,12 @@ export function UserEventsTable({
         cell: renderTimeCell,
       },
       {
+        id: "processingTime",
+        header: "Processed At",
+        accessorKey: "processingTime",
+        cell: renderProcessingTimeCell,
+      },
+      {
         id: "messageId",
         header: "Message ID",
         accessorKey: "messageId",
@@ -753,6 +782,7 @@ export function UserEventsTable({
       renderEventNameCell,
       renderTraitsCell,
       renderTimeCell,
+      renderProcessingTimeCell,
       renderMessageIdCell,
     ],
   );
@@ -887,6 +917,35 @@ export function UserEventsTable({
             ))}
           </Select>
         </FormControl>
+        <Divider
+          orientation="vertical"
+          flexItem
+          sx={{ borderColor: "grey.300" }}
+        />
+        <TextField
+          size="small"
+          placeholder="Search events..."
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
+          InputProps={{
+            startAdornment: (
+              <InputAdornment position="start">
+                <SearchIcon sx={{ color: "grey.500" }} />
+              </InputAdornment>
+            ),
+          }}
+          sx={{
+            minWidth: 200,
+            "& .MuiOutlinedInput-root": {
+              "& fieldset": {
+                borderColor: "grey.400",
+              },
+              "&:hover fieldset": {
+                borderColor: "grey.500",
+              },
+            },
+          }}
+        />
         <Divider
           orientation="vertical"
           flexItem

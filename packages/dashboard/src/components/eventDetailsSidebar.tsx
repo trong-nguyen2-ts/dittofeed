@@ -35,9 +35,26 @@ import {
 import ReactCodeMirror from "@uiw/react-codemirror";
 import formatDistanceToNow from "date-fns/formatDistanceToNow";
 import Link from "next/link";
-import React, { useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { EventResources } from "../lib/types";
+
+const SIDEBAR_WIDTH_KEY = "eventDetailsSidebarWidth";
+const DEFAULT_WIDTH_PERCENT = 30;
+const MIN_WIDTH_PERCENT = 10;
+const MAX_WIDTH_PERCENT = 90;
+
+function getInitialWidth(): number {
+  if (typeof window === "undefined") return DEFAULT_WIDTH_PERCENT;
+  const saved = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+  if (saved) {
+    const parsed = parseFloat(saved);
+    if (!Number.isNaN(parsed) && parsed >= MIN_WIDTH_PERCENT && parsed <= MAX_WIDTH_PERCENT) {
+      return parsed;
+    }
+  }
+  return DEFAULT_WIDTH_PERCENT;
+}
 
 interface SelectedEvent {
   messageId: string;
@@ -214,6 +231,57 @@ function EventDetailsSidebar({
     message: string;
   }>({ open: false, message: "" });
 
+  // Resize state
+  const [widthPercent, setWidthPercent] = useState(getInitialWidth);
+  const [isResizing, setIsResizing] = useState(false);
+  const startXRef = useRef(0);
+  const startWidthRef = useRef(0);
+
+  // Handle mouse down on resize handle
+  const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    setIsResizing(true);
+    startXRef.current = e.clientX;
+    startWidthRef.current = widthPercent;
+  }, [widthPercent]);
+
+  // Handle mouse move during resize
+  useEffect(() => {
+    if (!isResizing) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      const viewportWidth = window.innerWidth;
+      const deltaX = startXRef.current - e.clientX;
+      const deltaPercent = (deltaX / viewportWidth) * 100;
+      const newWidth = Math.min(
+        MAX_WIDTH_PERCENT,
+        Math.max(MIN_WIDTH_PERCENT, startWidthRef.current + deltaPercent)
+      );
+      setWidthPercent(newWidth);
+    };
+
+    const handleMouseUp = () => {
+      setIsResizing(false);
+      // Save to localStorage
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, widthPercent.toString());
+    };
+
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+
+    return () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [isResizing, widthPercent]);
+
+  // Save width on change (debounced by mouseup)
+  useEffect(() => {
+    if (!isResizing) {
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, widthPercent.toString());
+    }
+  }, [widthPercent, isResizing]);
+
   const formattedTraits = useMemo(() => {
     if (selectedEvent?.traits) {
       try {
@@ -247,19 +315,50 @@ function EventDetailsSidebar({
   if (!selectedEvent) return null;
 
   return (
-    <Drawer
-      open={open}
-      onClose={onClose}
-      anchor="right"
-      sx={{
-        "& .MuiDrawer-paper": {
-          width: "500px",
-          maxWidth: "40vw",
-        },
-        zIndex: 3000,
-      }}
-    >
-      <Stack sx={{ height: "100%" }}>
+    <>
+      {/* Transparent overlay to capture mouse events during resize */}
+      {isResizing && (
+        <Box
+          sx={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            zIndex: 9999,
+            cursor: "ew-resize",
+            backgroundColor: "transparent",
+          }}
+        />
+      )}
+      <Drawer
+        open={open}
+        onClose={onClose}
+        anchor="right"
+        sx={{
+          "& .MuiDrawer-paper": {
+            width: `${widthPercent}vw`,
+          },
+          zIndex: 3000,
+        }}
+      >
+        {/* Resize handle */}
+        <Box
+          onMouseDown={handleResizeMouseDown}
+          sx={{
+            position: "absolute",
+            left: 0,
+            top: 0,
+            bottom: 0,
+            width: "10px",
+            cursor: "ew-resize",
+            zIndex: 1,
+            "&:hover": {
+              backgroundColor: "rgba(0, 0, 0, 0.04)",
+            },
+          }}
+        />
+        <Stack sx={{ height: "100%", marginLeft: "10px" }}>
         {/* Header */}
         <Paper
           elevation={1}
@@ -318,12 +417,13 @@ function EventDetailsSidebar({
             display: "flex",
             minHeight: 0,
             overflow: "auto",
+            width: "100%",
           }}
         >
           {activeTab === 0 && (
-            <Stack spacing={2} sx={{ p: 2 }}>
+            <Stack spacing={2} sx={{ p: 2, width: "100%" }}>
               {/* Event Overview */}
-              <Card variant="outlined">
+              <Card variant="outlined" sx={{ width: "100%" }}>
                 <CardHeader
                   title="Event Overview"
                   titleTypographyProps={{
@@ -363,7 +463,7 @@ function EventDetailsSidebar({
               </Card>
 
               {/* User Information */}
-              <Card variant="outlined">
+              <Card variant="outlined" sx={{ width: "100%" }}>
                 <CardHeader
                   title="User Information"
                   titleTypographyProps={{
@@ -414,7 +514,7 @@ function EventDetailsSidebar({
 
               {/* Related Resources */}
               {eventResources.length > 0 && (
-                <Card variant="outlined">
+                <Card variant="outlined" sx={{ width: "100%" }}>
                   <CardHeader
                     title="Related Resources"
                     titleTypographyProps={{
@@ -520,6 +620,7 @@ function EventDetailsSidebar({
         anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
       />
     </Drawer>
+    </>
   );
 }
 
