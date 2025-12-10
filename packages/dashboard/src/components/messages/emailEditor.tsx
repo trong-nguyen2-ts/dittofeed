@@ -1,4 +1,5 @@
 import AddIcon from "@mui/icons-material/Add";
+import CloseIcon from "@mui/icons-material/Close";
 import DeleteIcon from "@mui/icons-material/Delete";
 import {
   Autocomplete,
@@ -17,6 +18,8 @@ import {
 import {
   ChannelType,
   CompletionStatus,
+  EmailContentsType,
+  MessageTemplateConfiguration,
   MessageTemplateResourceDraft,
   RenderMessageTemplateRequestContent,
   RenderMessageTemplateRequestContents,
@@ -33,9 +36,7 @@ import EmailPreviewHeader from "../emailPreviewHeader";
 import TemplateEditor, {
   DraftToPreview,
   RenderEditorParams,
-  RenderTemplateRequest,
   TemplateEditorMode,
-  TestTemplateRequest,
 } from "../templateEditor";
 import CodeEmailBodyEditor from "./codeEmailBodyEditor";
 
@@ -152,7 +153,18 @@ function EmailOptions({ draft, setDraft, disabled }: RenderEditorParams) {
         maxWidth="sm"
         fullWidth
       >
-        <DialogTitle> Email Options </DialogTitle>
+        <DialogTitle>
+          <Stack
+            direction="row"
+            justifyContent="space-between"
+            alignItems="center"
+          >
+            Email Options
+            <IconButton onClick={() => setOpen(false)}>
+              <CloseIcon />
+            </IconButton>
+          </Stack>
+        </DialogTitle>
         <DialogContent>
           <Stack sx={{ pt: 1 }}>
             <TextField
@@ -201,6 +213,19 @@ function EmailOptions({ draft, setDraft, disabled }: RenderEditorParams) {
                 });
               }}
               value={draft.replyTo ?? ""}
+              sx={{ mb: 2 }}
+            />
+            <TextField
+              label="Display Name"
+              variant="outlined"
+              fullWidth
+              disabled={disabled}
+              value={draft.name ?? ""}
+              onChange={(e) => {
+                setDraft((defn) => {
+                  return { ...defn, name: e.target.value };
+                });
+              }}
               sx={{ mb: 2 }}
             />
             <Autocomplete
@@ -318,7 +343,7 @@ const draftToPreview: DraftToPreview = (
     throw new Error("Invalid channel type");
   }
   let body: RenderMessageTemplateRequestContent;
-  if ("emailContentsType" in definition) {
+  if (definition.emailContentsType === EmailContentsType.LowCode) {
     body = {
       type: RenderMessageTemplateType.Emailo,
       value: definition.body,
@@ -361,9 +386,10 @@ export default function EmailEditor({
   disabled,
   member,
   mode,
-  renderTemplateRequest,
   defaultIsUserPropertiesMinimised,
-  testTemplateRequest,
+  hideUserPropertiesPanel,
+  hideEditor,
+  messageTemplateConfiguration,
 }: {
   templateId: string;
   hidePublisher?: boolean;
@@ -371,9 +397,10 @@ export default function EmailEditor({
   disabled?: boolean;
   member?: WorkspaceMemberResource;
   mode?: TemplateEditorMode;
-  renderTemplateRequest?: RenderTemplateRequest;
   defaultIsUserPropertiesMinimised?: boolean;
-  testTemplateRequest?: TestTemplateRequest;
+  hideUserPropertiesPanel?: boolean;
+  hideEditor?: boolean;
+  messageTemplateConfiguration?: Omit<MessageTemplateConfiguration, "type">;
 }) {
   const theme = useTheme();
   const disabledStyles: SxProps<Theme> = {
@@ -472,7 +499,7 @@ export default function EmailEditor({
         if (draft.type !== ChannelType.Email) {
           return null;
         }
-        if ("emailContentsType" in draft) {
+        if (draft.emailContentsType === EmailContentsType.LowCode) {
           return (
             <LowCodeEmailBodyEditor
               draft={draft}
@@ -503,9 +530,10 @@ export default function EmailEditor({
       )}
       draftToPreview={draftToPreview}
       fieldToReadable={fieldToReadable}
-      renderTemplateRequest={renderTemplateRequest}
       defaultIsUserPropertiesMinimised={defaultIsUserPropertiesMinimised}
-      testTemplateRequest={testTemplateRequest}
+      hideUserPropertiesPanel={hideUserPropertiesPanel}
+      hideEditor={hideEditor}
+      messageTemplateConfiguration={messageTemplateConfiguration}
     />
   );
 }

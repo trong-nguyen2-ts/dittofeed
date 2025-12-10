@@ -1,6 +1,7 @@
 // ensures types are imported to support single-tenant auth
 import "@fastify/secure-session";
 
+import { Worker } from "@temporalio/worker";
 import { BOOTSTRAP_OPTIONS } from "admin-cli/src/bootstrap";
 import { requestToSessionValue } from "api/src/buildApp/requestContext";
 import backendConfig from "backend-lib/src/config";
@@ -70,7 +71,7 @@ async function startLite() {
     logger().info("Skipping bootstrap");
   }
 
-  const { port, host, nodeEnv, mode } = liteConfig();
+  const { port, host, nodeEnv, mode, enableWorker } = liteConfig();
 
   const relativeDir = "dashboard";
   const packagesDir = findPackagesDir(__dirname);
@@ -105,19 +106,29 @@ async function startLite() {
     },
   });
 
-  logger().info({ mode }, "Starting dittofeed");
-  if (mode === "api") {
-    await app.listen({ port, host });
-  } else if (mode === "worker") {
-    const worker = await buildWorker(otel);
-    otel.start();
-    await worker.run();
-  } else {
-    const worker = await buildWorker(otel);
-    otel.start();
-    await Promise.all([app.listen({ port, host }), worker.run()]);
+  // Determine whether to run worker based on mode or enableWorker config
+  const shouldRunWorker = mode === "worker" || mode === "all" || enableWorker;
+  const shouldRunApi = mode === "api" || mode === "all";
+
+  let worker: Worker | null = null;
+  if (shouldRunWorker) {
+    worker = await buildWorker(otel);
   }
 
+  otel.start();
+
+  logger().info({ mode, enableWorker }, "Starting dittofeed");
+
+  if (mode === "api" && !shouldRunWorker) {
+    // API only mode
+    await app.listen({ port, host });
+  } else if (mode === "worker" && !shouldRunApi) {
+    // Worker only mode
+    await worker?.run();
+  } else {
+    // All mode (both API and worker)
+    await Promise.all([app.listen({ port, host }), worker?.run()]);
+  }
 }
 
 startLite()

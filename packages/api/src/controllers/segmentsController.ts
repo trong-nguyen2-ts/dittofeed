@@ -7,15 +7,23 @@ import * as schema from "backend-lib/src/db/schema";
 import logger from "backend-lib/src/logger";
 import {
   buildSegmentsFile,
+  deleteSegment,
   toSegmentResource,
+  updateSegmentStatus,
   upsertSegment,
 } from "backend-lib/src/segments";
+import {
+  clearManualSegment,
+  getManualSegmentStatus,
+  updateManualSegmentUsers,
+} from "backend-lib/src/segments/manualSegments";
 import { randomUUID } from "crypto";
 import csvParser from "csv-parser";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { FastifyInstance } from "fastify";
 import {
   DataSources,
+  MANUAL_SEGMENT_APPEND_HEADER,
   SEGMENT_ID_HEADER,
   WORKSPACE_ID_HEADER,
 } from "isomorphic-lib/src/constants";
@@ -25,22 +33,25 @@ import {
   schemaValidateWithErr,
 } from "isomorphic-lib/src/resultHandling/schemaValidation";
 import {
+  BaseMessageResponse,
   BaseUserUploadRow,
   BatchItem,
+  ClearManualSegmentRequest,
   CsvUploadValidationError,
   DeleteSegmentRequest,
   EmptyResponse,
   EventType,
+  GetManualSegmentStatusRequest,
+  GetManualSegmentStatusResponse,
   GetSegmentsRequest,
   GetSegmentsResponse,
-  InternalEventType,
   KnownBatchIdentifyData,
-  KnownBatchTrackData,
-  ManualSegmentOperationEnum,
   ManualSegmentUploadCsvHeaders,
   SavedSegmentResource,
   SegmentDefinition,
   SegmentNodeType,
+  UpdateManualSegmentUsersRequest,
+  UpdateSegmentStatusRequest,
   UpsertSegmentResource,
   UpsertSegmentValidationError,
   UserUploadRowErrors,
@@ -64,11 +75,73 @@ export default async function segmentsController(fastify: FastifyInstance) {
       },
     },
     async (request, reply) => {
+      const conditions = [
+        eq(schema.segment.workspaceId, request.query.workspaceId),
+      ];
+      if (request.query.ids) {
+        conditions.push(inArray(schema.segment.id, request.query.ids));
+      }
+      if (request.query.resourceType) {
+        conditions.push(
+          eq(schema.segment.resourceType, request.query.resourceType),
+        );
+      }
       const segmentModels = await db().query.segment.findMany({
-        where: eq(schema.segment.workspaceId, request.query.workspaceId),
+        where: and(...conditions),
       });
       const segments = segmentModels.map((s) => unwrap(toSegmentResource(s)));
       return reply.status(200).send({ segments });
+    },
+  );
+
+  fastify.withTypeProvider<TypeBoxTypeProvider>().post(
+    "/manual-segment/update",
+    {
+      schema: {
+        description: "Update a manual segment.",
+        tags: ["Segments"],
+        body: UpdateManualSegmentUsersRequest,
+      },
+    },
+    async (request, reply) => {
+      await updateManualSegmentUsers(request.body);
+      return reply.status(200).send();
+    },
+  );
+
+  fastify.withTypeProvider<TypeBoxTypeProvider>().post(
+    "/manual-segment/clear",
+    {
+      schema: {
+        description: "Clear a manual segment.",
+        tags: ["Segments"],
+        body: ClearManualSegmentRequest,
+      },
+    },
+    async (request, reply) => {
+      await clearManualSegment(request.body);
+      return reply.status(200).send();
+    },
+  );
+
+  fastify.withTypeProvider<TypeBoxTypeProvider>().get(
+    "/manual-segment/status",
+    {
+      schema: {
+        description: "Get the status of a manual segment.",
+        tags: ["Segments"],
+        querystring: GetManualSegmentStatusRequest,
+        response: {
+          200: GetManualSegmentStatusResponse,
+        },
+      },
+    },
+    async (request, reply) => {
+      const status = await getManualSegmentStatus(request.query);
+      if (!status) {
+        return reply.status(404).send();
+      }
+      return reply.status(200).send(status);
     },
   );
 
@@ -94,6 +167,42 @@ export default async function segmentsController(fastify: FastifyInstance) {
     },
   );
 
+  fastify.withTypeProvider<TypeBoxTypeProvider>().patch(
+    "/status",
+    {
+      schema: {
+        description: "Update segment status.",
+        tags: ["Segments"],
+        body: UpdateSegmentStatusRequest,
+        response: {
+          200: SavedSegmentResource,
+          400: BaseMessageResponse,
+          404: EmptyResponse,
+        },
+      },
+    },
+    async (request, reply) => {
+      const { workspaceId, id, status }: UpdateSegmentStatusRequest =
+        request.body;
+
+      const updated = await updateSegmentStatus({
+        workspaceId,
+        id,
+        status,
+      });
+      if (updated.isErr()) {
+        return reply.status(400).send({
+          message: updated.error.message,
+        });
+      }
+      if (!updated.value) {
+        return reply.status(404).send();
+      }
+
+      return reply.status(200).send(updated.value);
+    },
+  );
+
   fastify.withTypeProvider<TypeBoxTypeProvider>().delete(
     "/",
     {
@@ -108,17 +217,30 @@ export default async function segmentsController(fastify: FastifyInstance) {
       },
     },
     async (request, reply) => {
-      const { id, workspaceId } = request.body;
-      const result = await db()
-        .delete(schema.segment)
-        .where(
-          and(
-            eq(schema.segment.id, id),
-            eq(schema.segment.workspaceId, workspaceId),
-          ),
-        )
-        .returning();
-      if (!result.length) {
+      const result = await deleteSegment(request.body);
+      if (!result) {
+        return reply.status(404).send();
+      }
+      return reply.status(204).send();
+    },
+  );
+
+  fastify.withTypeProvider<TypeBoxTypeProvider>().delete(
+    "/v2",
+    {
+      schema: {
+        description: "Delete a segment.",
+        tags: ["Segments"],
+        querystring: DeleteSegmentRequest,
+        response: {
+          204: EmptyResponse,
+          404: EmptyResponse,
+        },
+      },
+    },
+    async (request, reply) => {
+      const result = await deleteSegment(request.query);
+      if (!result) {
         return reply.status(404).send();
       }
       return reply.status(204).send();
@@ -174,7 +296,11 @@ export default async function segmentsController(fastify: FastifyInstance) {
       const csvStream = file;
       const workspaceId = request.headers[WORKSPACE_ID_HEADER];
       const segmentId = request.headers[SEGMENT_ID_HEADER];
-      const { operation } = request.headers;
+      const appendHeader = request.headers[MANUAL_SEGMENT_APPEND_HEADER];
+      const append =
+        typeof appendHeader === "string"
+          ? ["1", "true", "yes", "append"].includes(appendHeader.toLowerCase())
+          : appendHeader === true;
 
       // Parse the CSV stream into a JavaScript object with an array of rows
       const csvPromise = new Promise<CsvParseResult>((resolve) => {
@@ -284,52 +410,42 @@ export default async function segmentsController(fastify: FastifyInstance) {
 
       const currentTime = new Date();
       const timestamp = currentTime.toISOString();
-      const batch: BatchItem[] = [];
-      const inSegment = operation === ManualSegmentOperationEnum.Add ? 1 : 0;
+      const userIds = rows.value.map((row) => row.id);
 
-      for (const row of rows.value) {
+      const batch: BatchItem[] = rows.value.flatMap((row) => {
         const { id, ...rest } = row;
-
-        batch.push({
+        if (Object.keys(rest).length === 0) {
+          return [];
+        }
+        const event: KnownBatchIdentifyData = {
           type: EventType.Identify,
           userId: id,
           timestamp,
           traits: rest,
           messageId: randomUUID(),
-        } satisfies KnownBatchIdentifyData);
+        };
+        return event;
+      });
 
-        batch.push({
-          type: EventType.Track,
-          userId: id,
-          timestamp,
-          event: InternalEventType.ManualSegmentUpdate,
-          properties: {
-            segmentId,
-            version: definition.entryNode.version,
-            inSegment,
-          },
-          messageId: randomUUID(),
-        } satisfies KnownBatchTrackData);
-      }
-
-      logger().debug(
-        {
-          batch,
+      if (batch.length > 0) {
+        const data: SubmitBatchOptions = {
           workspaceId,
-          segmentId,
-        },
-        "submitting manual segment batch",
-      );
-      const data: SubmitBatchOptions = {
-        workspaceId,
-        data: {
-          context: {
-            source: DataSources.ManualSegment,
+          data: {
+            context: {
+              source: DataSources.ManualSegment,
+            },
+            batch,
           },
-          batch,
-        },
-      };
-      await submitBatchWithTriggers(data);
+        };
+        await submitBatchWithTriggers(data);
+      }
+      await updateManualSegmentUsers({
+        workspaceId,
+        segmentId,
+        userIds,
+        sync: true,
+        append,
+      });
 
       const response = await reply.status(200).send();
       return response;

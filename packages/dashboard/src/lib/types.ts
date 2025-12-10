@@ -41,13 +41,12 @@ import {
   PartialSegmentResource,
   PersistedEmailProvider,
   PersistedSmsProvider,
+  RandomCohortUiNodeProps,
   RequestStatus,
   SavedJourneyResource,
   SavedSubscriptionGroupResource,
   SecretAvailabilityResource,
   SecretResource,
-  SegmentNode,
-  SegmentNodeType,
   SegmentResource,
   SegmentSplitUiNodeProps,
   SourceControlProviderEnum,
@@ -92,6 +91,7 @@ export {
   type JourneyUiNodeTypeProps,
   type JourneyUiPlaceholderEdgeProps,
   type MessageUiNodeProps,
+  type RandomCohortUiNodeProps,
   type SegmentSplitUiNodeProps,
   TimeUnit,
   type WaitForUiNodeProps,
@@ -177,8 +177,11 @@ export type AppState = {
     | "enableAdditionalDashboardSettings"
     | "additionalDashboardSettingsPath"
     | "additionalDashboardSettingsTitle"
+    | "gmailClientId"
   > &
-  Partial<Pick<Config, "signoutUrl">>;
+  Partial<Pick<Config, "signoutUrl" | "authMode">>;
+
+export type DeleteJourney = (segmentId: string) => void;
 
 export interface AppActions {
   toggleDrawer: () => void;
@@ -193,7 +196,7 @@ export interface AppActions {
   upsertSegment: (segment: PartialSegmentResource) => void;
   deleteSegment: (segmentId: string) => void;
   upsertJourney: (journey: SavedJourneyResource) => void;
-  deleteJourney: (segmentId: string) => void;
+  deleteJourney: DeleteJourney;
   upsertSecrets: (secrets: SecretResource[]) => void;
   deleteSecret: (secretName: string) => void;
   upsertSubscriptionGroup: (
@@ -222,13 +225,6 @@ export interface AppActions {
     key: string;
     value: boolean;
   }) => void;
-}
-
-export interface SegmentIndexContent {
-  segmentDeleteRequest: EphemeralRequestStatus<Error>;
-  setSegmentDeleteRequest: (request: EphemeralRequestStatus<Error>) => void;
-  segmentDownloadRequest: EphemeralRequestStatus<Error>;
-  setSegmentDownloadRequest: (request: EphemeralRequestStatus<Error>) => void;
 }
 
 export interface UserPropertyIndexContent {
@@ -305,21 +301,6 @@ export interface SegmentEditorState {
   segmentUpdateRequest: EphemeralRequestStatus<Error>;
 }
 
-export interface SegmentEditorContents extends SegmentEditorState {
-  setEditableSegmentName: (name: string) => void;
-  addEditableSegmentChild: (parentId: string) => void;
-  removeEditableSegmentChild: (parentId: string, nodeId: string) => void;
-  updateEditableSegmentNodeType: (
-    nodeId: string,
-    nodeType: SegmentNodeType,
-  ) => void;
-  updateEditableSegmentNodeData: (
-    nodeId: string,
-    updater: (currentValue: Draft<SegmentNode>) => void,
-  ) => void;
-  setSegmentUpdateRequest: (request: EphemeralRequestStatus<Error>) => void;
-}
-
 export type JourneyNodesIndex = Record<string, number>;
 
 export type DefinitionJourneyNode = Node<
@@ -355,15 +336,15 @@ export interface AddNodesParams {
   edges: JourneyUiEdge[];
 }
 
-type JourneyNodeUpdaterInPlace = (
+export type JourneyNodeUpdaterInPlace = (
   currentValue: Draft<DefinitionJourneyNode>,
 ) => void;
 
-type JourneyNodeUpdaterReturning = (
+export type JourneyNodeUpdaterReturning = (
   currentValue: Draft<DefinitionJourneyNode>,
 ) => DefinitionJourneyNode;
 
-type JourneyNodeUpdater =
+export type JourneyNodeUpdater =
   | JourneyNodeUpdaterInPlace
   | JourneyNodeUpdaterReturning;
 
@@ -372,11 +353,19 @@ export interface JourneyContent extends JourneyState {
     t: JourneyUiBodyNodeTypeProps["type"] | null,
   ) => void;
   setSelectedNodeId: (t: string | null) => void;
+  initJourneyState: (state: JourneyStateForResource) => void;
   addNodes: (params: AddNodesParams) => void;
   setEdges: (changes: EdgeChange<JourneyUiEdge>[]) => void;
   setNodes: (changes: NodeChange<JourneyUiNode>[]) => void;
   deleteJourneyNode: (nodeId: string) => void;
   updateJourneyNodeData: (nodeId: string, updater: JourneyNodeUpdater) => void;
+  addRandomCohortChild: ({ nodeId }: { nodeId: string }) => void;
+  removeRandomCohortChild: ({
+    nodeId,
+  }: {
+    nodeId: string;
+    childName: string;
+  }) => void;
   setJourneyUpdateRequest: (request: EphemeralRequestStatus<Error>) => void;
   setJourneyName: (name: string) => void;
   updateLabelNode: (nodeId: string, title: string) => void;
@@ -389,9 +378,7 @@ export interface JourneyContent extends JourneyState {
   }) => void;
 }
 
-export type PageStoreContents = SegmentEditorContents &
-  SegmentIndexContent &
-  UserPropertyIndexContent &
+export type PageStoreContents = UserPropertyIndexContent &
   JourneyIndexContent &
   UserIndexContent &
   MessageTemplateIndexContent &
@@ -421,4 +408,9 @@ export type JourneyUiNodeLabel = Node<
 export type JourneyUiNodeDefinition = Node<
   JourneyUiNodeDefinitionProps,
   "JourneyUiNodeDefinition"
+>;
+
+export type JourneyStateForResource = Pick<
+  JourneyState,
+  "journeyNodes" | "journeyEdges" | "journeyNodesIndex" | "journeyName"
 >;

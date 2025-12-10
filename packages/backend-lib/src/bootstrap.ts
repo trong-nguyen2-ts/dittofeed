@@ -55,7 +55,11 @@ import {
   WorkspaceTypeApp,
   WorkspaceTypeAppEnum,
 } from "./types";
-import { createUserEventsTables } from "./userEvents/clickhouse";
+import {
+  createKafkaTables,
+  createUserEventsTables,
+  dropKafkaTables,
+} from "./userEvents/clickhouse";
 import { upsertWorkspace } from "./workspaces/createWorkspace";
 
 const DOMAIN_REGEX =
@@ -77,13 +81,26 @@ const INVALID_COMMON_EMAIL_DOMAINS = new Set([
 
 function isValidDomain(domain: string): boolean {
   if (!domain) return false;
-  if (domain.length > 255) return false;
-  if (domain.startsWith(".") || domain.endsWith(".")) return false;
+  const lowerDomain = domain.toLowerCase();
 
-  // Reject common email domains
-  if (INVALID_COMMON_EMAIL_DOMAINS.has(domain)) return false;
+  if (lowerDomain.length > 255) return false;
+  if (lowerDomain.startsWith(".") || lowerDomain.endsWith(".")) return false;
 
-  return DOMAIN_REGEX.test(domain);
+  // Reject common email domains by checking their constituent parts
+  const parts = lowerDomain.split(".");
+  // A domain must have at least two parts (e.g., name.tld) to be checked here.
+  // Shorter or malformed domains will be caught by the DOMAIN_REGEX.
+  if (parts.length >= 2) {
+    // Iterate through parts of the domain, excluding the last part (assumed TLD).
+    // For "foo.gmail.com", parts are ["foo", "gmail", "com"]. We check "foo" and "gmail".
+    for (const part of parts) {
+      if (INVALID_COMMON_EMAIL_DOMAINS.has(part)) {
+        return false; // Found a restricted part
+      }
+    }
+  }
+
+  return DOMAIN_REGEX.test(lowerDomain);
 }
 
 export async function bootstrapPostgres({
@@ -238,7 +255,7 @@ export async function bootstrapPostgres({
         type: UserPropertyDefinitionType.Trait,
         path: "accountManager",
       },
-      exampleValue: '"Jane Johnson"',
+      exampleValue: '"jane.johnson@example.com"',
     },
     {
       name: "latLon",
@@ -248,6 +265,15 @@ export async function bootstrapPostgres({
         path: "latLon",
       },
       exampleValue: "33.812511,-117.9189762",
+    },
+    {
+      name: "timezone",
+      workspaceId,
+      definition: {
+        type: UserPropertyDefinitionType.Trait,
+        path: "timezone",
+      },
+      exampleValue: '"America/New_York"',
     },
   ];
   if (userPropertyAllowList) {
@@ -297,13 +323,6 @@ export async function bootstrapPostgres({
     }),
     upsertSubscriptionGroup({
       workspaceId,
-      id: uuidv5("mobile-push-subscription-group", workspaceId),
-      name: `${workspaceName} - Mobile Push`,
-      type: SubscriptionGroupType.OptOut,
-      channel: ChannelType.MobilePush,
-    }),
-    upsertSubscriptionGroup({
-      workspaceId,
       id: uuidv5("sms-subscription-group", workspaceId),
       name: `${workspaceName} - SMS`,
       type: SubscriptionGroupType.OptOut,
@@ -345,35 +364,68 @@ export async function bootstrapPostgres({
   });
 }
 
-async function bootstrapKafka() {
+export async function bootstrapKafka() {
   const {
     userEventsTopicName,
     kafkaUserEventsPartitions,
     kafkaUserEventsReplicationFactor,
   } = config();
-  await kafkaAdmin().connect();
 
-  await kafkaAdmin().createTopics({
-    waitForLeaders: true,
-    topics: [
-      {
-        topic: userEventsTopicName,
-        numPartitions: kafkaUserEventsPartitions,
-        replicationFactor: kafkaUserEventsReplicationFactor,
-      },
-    ],
-  });
+  const admin = kafkaAdmin();
+  await admin.connect();
 
-  await kafkaAdmin().disconnect();
+  try {
+    // Check if topic already exists to make operation idempotent
+    const existingTopics = await admin.listTopics();
+    const topicExists = existingTopics.includes(userEventsTopicName);
+
+    if (!topicExists) {
+      // Set waitForLeaders: false to avoid KafkaJS hanging bug
+      // Add timeout to prevent indefinite hanging
+      await admin.createTopics({
+        waitForLeaders: false,
+        timeout: 30000,
+        topics: [
+          {
+            topic: userEventsTopicName,
+            numPartitions: kafkaUserEventsPartitions,
+            replicationFactor: kafkaUserEventsReplicationFactor,
+          },
+        ],
+      });
+
+      logger().info({ topic: userEventsTopicName }, "Created Kafka topic");
+    } else {
+      logger().info(
+        { topic: userEventsTopicName },
+        "Kafka topic already exists",
+      );
+    }
+
+    // Drop and recreate Kafka tables if using Kafka write mode
+    try {
+      logger().info("Dropping Kafka clickhouse tables");
+      await dropKafkaTables();
+    } catch (error) {
+      logger().warn("Failed to drop kafka tables, continuing anyway", {
+        err: error,
+      });
+    }
+
+    logger().info("Creating Kafka clickhouse tables");
+    await createKafkaTables({
+      ingressTopic: userEventsTopicName,
+    });
+  } finally {
+    await admin.disconnect();
+  }
 }
 
 export async function bootstrapClickhouse() {
   logger().info("Bootstrapping clickhouse.");
   await createClickhouseDb();
 
-  await createUserEventsTables({
-    ingressTopic: config().userEventsTopicName,
-  });
+  await createUserEventsTables();
 }
 
 async function insertDefaultEvents({ workspaceId }: { workspaceId: string }) {
@@ -493,6 +545,12 @@ export async function bootstrapWorkspace({
   return { workspaceId };
 }
 
+export async function bootstrapBlobStorage() {
+  await createBucket(storage(), {
+    bucketName: config().blobStorageBucket,
+  });
+}
+
 export async function bootstrapDependencies(): Promise<void> {
   const promises = [
     drizzleMigrate(),
@@ -501,11 +559,7 @@ export async function bootstrapDependencies(): Promise<void> {
     ),
   ];
   if (config().enableBlobStorage) {
-    promises.push(
-      createBucket(storage(), {
-        bucketName: config().blobStorageBucket,
-      }),
-    );
+    promises.push(bootstrapBlobStorage());
   }
   if (config().writeMode === "kafka") {
     promises.push(bootstrapKafka());

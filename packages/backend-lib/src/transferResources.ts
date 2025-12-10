@@ -194,6 +194,8 @@ function mapSegmentOperator({
       return operator;
     case SegmentOperatorType.NotExists:
       return operator;
+    case SegmentOperatorType.AbsoluteTimestamp:
+      return operator;
     default:
       assertUnreachable(operator);
   }
@@ -326,7 +328,7 @@ function mapJourneyBodyNode({
           segment: getWithDefault("segment", segmentMap, child.segmentId),
         })),
       } satisfies WaitForNode;
-    case JourneyNodeType.ExperimentSplitNode:
+    case JourneyNodeType.RandomCohortNode:
       throw new Error("Not implemented");
     case JourneyNodeType.RateLimitNode:
       throw new Error("Not implemented");

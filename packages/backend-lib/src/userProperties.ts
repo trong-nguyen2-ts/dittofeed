@@ -1,6 +1,6 @@
 import { ValueError } from "@sinclair/typebox/errors";
 import { randomUUID } from "crypto";
-import { and, eq, inArray, SQL } from "drizzle-orm";
+import { and, eq, inArray, not, or, SQL } from "drizzle-orm";
 import { toJsonPathParam } from "isomorphic-lib/src/jsonPath";
 import protectedUserProperties from "isomorphic-lib/src/protectedUserProperties";
 import { schemaValidate } from "isomorphic-lib/src/resultHandling/schemaValidation";
@@ -17,6 +17,7 @@ import { validate as validateUuid } from "uuid";
 import {
   clickhouseClient,
   ClickHouseQueryBuilder,
+  command as chCommand,
   query as chQuery,
 } from "./clickhouse";
 import { assignmentSequentialConsistency } from "./config";
@@ -24,12 +25,16 @@ import { db, QueryError, queryResult, upsert } from "./db";
 import { userProperty as dbUserProperty } from "./db/schema";
 import logger from "./logger";
 import {
+  DeleteUserPropertyRequest,
   EnrichedUserProperty,
   GroupChildrenUserPropertyDefinitions,
   JSONValue,
   KeyedPerformedUserPropertyDefinition,
   PerformedUserPropertyDefinition,
   SavedUserPropertyResource,
+  UpdateUserPropertyStatusError,
+  UpdateUserPropertyStatusErrorType,
+  UpdateUserPropertyStatusRequest,
   UpsertUserPropertyError,
   UpsertUserPropertyErrorType,
   UpsertUserPropertyResource,
@@ -85,6 +90,7 @@ export function toSavedUserPropertyResource(
       updatedAt,
       exampleValue,
       definitionUpdatedAt,
+      status,
     }) => ({
       workspaceId,
       name,
@@ -94,19 +100,39 @@ export function toSavedUserPropertyResource(
       createdAt: createdAt.getTime(),
       updatedAt: updatedAt.getTime(),
       definitionUpdatedAt: definitionUpdatedAt.getTime(),
+      status,
     }),
   );
 }
 
 export async function findAllUserProperties({
   workspaceId,
+  requireRunning = false,
+  ids,
+  names,
 }: {
   workspaceId: string;
+  requireRunning?: boolean;
+  ids?: string[];
+  names?: string[];
 }): Promise<EnrichedUserProperty[]> {
-  const userProperties = await db()
-    .select()
-    .from(dbUserProperty)
-    .where(eq(dbUserProperty.workspaceId, workspaceId));
+  const conditions: SQL[] = [eq(dbUserProperty.workspaceId, workspaceId)];
+  if (requireRunning) {
+    conditions.push(eq(dbUserProperty.status, "Running"));
+  }
+  const identifierConditions: SQL[] = [];
+  if (ids?.length) {
+    identifierConditions.push(inArray(dbUserProperty.id, ids));
+  }
+  if (names?.length) {
+    identifierConditions.push(inArray(dbUserProperty.name, names));
+  }
+  const identifierWhere: SQL | undefined = or(...identifierConditions);
+  if (identifierWhere) {
+    conditions.push(identifierWhere);
+  }
+  const where = and(...conditions);
+  const userProperties = await db().select().from(dbUserProperty).where(where);
 
   const enrichedUserProperties: EnrichedUserProperty[] = [];
 
@@ -126,10 +152,21 @@ export async function findAllUserProperties({
 
 export async function findAllUserPropertyResources({
   workspaceId,
+  requireRunning,
+  ids,
+  names,
 }: {
   workspaceId: string;
+  requireRunning?: boolean;
+  ids?: string[];
+  names?: string[];
 }): Promise<SavedUserPropertyResource[]> {
-  const userProperties = await findAllUserProperties({ workspaceId });
+  const userProperties = await findAllUserProperties({
+    workspaceId,
+    requireRunning,
+    ids: ids?.length ? ids : undefined,
+    names: names?.length ? names : undefined,
+  });
 
   return userProperties.map((up) => ({
     ...up,
@@ -137,6 +174,7 @@ export async function findAllUserPropertyResources({
     definitionUpdatedAt: up.definitionUpdatedAt.getTime(),
     createdAt: up.createdAt.getTime(),
     updatedAt: up.updatedAt.getTime(),
+    status: up.status,
   }));
 }
 
@@ -640,6 +678,12 @@ export async function findAllUserPropertyAssignmentsById({
 
 export async function upsertUserProperty(
   params: UpsertUserPropertyResource,
+  opts: {
+    // should only be used for testing, not exposed to client
+    skipProtectedCheck?: boolean;
+  } = {
+    skipProtectedCheck: false,
+  },
 ): Promise<Result<SavedUserPropertyResource, UpsertUserPropertyError>> {
   const {
     id,
@@ -658,7 +702,7 @@ export async function upsertUserProperty(
   const canCreate = workspaceId && name && definition;
   const definitionUpdatedAt = definition ? new Date() : undefined;
 
-  if (protectedUserProperties.has(name)) {
+  if (!opts.skipProtectedCheck && protectedUserProperties.has(name)) {
     return err({
       type: UpsertUserPropertyErrorType.ProtectedUserProperty,
       message: "User property name is protected",
@@ -848,4 +892,122 @@ export async function findUserIdsByUserPropertyValue({
   });
   const rows = await result.json<{ user_id: string }>();
   return rows.map((row) => row.user_id);
+}
+
+export async function updateUserPropertyStatus({
+  workspaceId,
+  id,
+  status,
+}: UpdateUserPropertyStatusRequest): Promise<
+  Result<SavedUserPropertyResource, UpdateUserPropertyStatusError>
+> {
+  const [updated] = await db()
+    .update(dbUserProperty)
+    .set({ status })
+    .where(
+      and(
+        eq(dbUserProperty.workspaceId, workspaceId),
+        eq(dbUserProperty.id, id),
+        not(inArray(dbUserProperty.name, Array.from(protectedUserProperties))),
+      ),
+    )
+    .returning();
+
+  if (!updated) {
+    // Check if it's because the property is protected or doesn't exist
+    const userProperties = await db()
+      .select()
+      .from(dbUserProperty)
+      .where(
+        and(
+          eq(dbUserProperty.workspaceId, workspaceId),
+          eq(dbUserProperty.id, id),
+        ),
+      );
+
+    const userProperty = userProperties[0];
+
+    if (userProperty && protectedUserProperties.has(userProperty.name)) {
+      return err({
+        type: UpdateUserPropertyStatusErrorType.ProtectedUserProperty,
+        message: "Cannot update status of protected user property",
+      });
+    }
+
+    return err({
+      type: UpdateUserPropertyStatusErrorType.NotFound,
+      message: "User property not found",
+    });
+  }
+
+  const result = toSavedUserPropertyResource(updated);
+  if (result.isErr()) {
+    logger().error(
+      { err: result.error, workspaceId, id },
+      "failed to convert user property to resource after status update",
+    );
+    return err({
+      type: UpdateUserPropertyStatusErrorType.NotFound,
+      message: "Failed to convert user property to resource",
+    });
+  }
+
+  return ok(result.value);
+}
+
+export async function deleteUserProperty({
+  workspaceId,
+  id,
+}: DeleteUserPropertyRequest): Promise<UserProperty | null> {
+  const [deleted] = await db()
+    .delete(dbUserProperty)
+    .where(
+      and(
+        eq(dbUserProperty.workspaceId, workspaceId),
+        eq(dbUserProperty.id, id),
+        not(inArray(dbUserProperty.name, Array.from(protectedUserProperties))),
+      ),
+    )
+    .returning();
+
+  if (!deleted) {
+    return null;
+  }
+
+  const qb = new ClickHouseQueryBuilder();
+  const workspaceIdParam = qb.addQueryValue(workspaceId, "String");
+  const computedPropertyIdParam = qb.addQueryValue(id, "String");
+  const typeParam = qb.addQueryValue("user_property", "String");
+
+  const queries = [
+    `DELETE FROM computed_property_state_v3 WHERE workspace_id = ${workspaceIdParam}
+     AND type = ${typeParam}
+     AND computed_property_id = ${computedPropertyIdParam} settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
+    `DELETE FROM computed_property_assignments_v2 WHERE workspace_id = ${workspaceIdParam}
+     AND type = ${typeParam}
+     AND computed_property_id = ${computedPropertyIdParam} settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
+    `DELETE FROM processed_computed_properties_v2 WHERE workspace_id = ${workspaceIdParam}
+     AND type = ${typeParam}
+     AND computed_property_id = ${computedPropertyIdParam} settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
+    `DELETE FROM computed_property_state_index WHERE workspace_id = ${workspaceIdParam}
+     AND type = ${typeParam}
+     AND computed_property_id = ${computedPropertyIdParam} settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
+    `DELETE FROM updated_computed_property_state WHERE workspace_id = ${workspaceIdParam}
+     AND type = ${typeParam}
+     AND computed_property_id = ${computedPropertyIdParam} settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
+    `DELETE FROM updated_property_assignments_v2 WHERE workspace_id = ${workspaceIdParam}
+     AND type = ${typeParam}
+     AND computed_property_id = ${computedPropertyIdParam} settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
+  ];
+
+  await Promise.all(
+    queries.map((query) =>
+      chCommand({
+        query,
+        query_params: qb.getQueries(),
+      }),
+    ),
+  );
+
+  return deleted;
 }

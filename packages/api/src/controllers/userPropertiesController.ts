@@ -1,19 +1,19 @@
 import { TypeBoxTypeProvider } from "@fastify/type-provider-typebox";
-import { db } from "backend-lib/src/db";
-import * as schema from "backend-lib/src/db/schema";
 import {
+  deleteUserProperty,
   findAllUserPropertyResources,
+  updateUserPropertyStatus,
   upsertUserProperty,
 } from "backend-lib/src/userProperties";
-import { and, eq, inArray, not } from "drizzle-orm";
 import { FastifyInstance } from "fastify";
-import protectedUserProperties from "isomorphic-lib/src/protectedUserProperties";
 import {
   DeleteUserPropertyRequest,
   EmptyResponse,
   ReadAllUserPropertiesRequest,
   ReadAllUserPropertiesResponse,
   SavedUserPropertyResource,
+  UpdateUserPropertyStatusError,
+  UpdateUserPropertyStatusRequest,
   UpsertUserPropertyError,
   UpsertUserPropertyResource,
 } from "isomorphic-lib/src/types";
@@ -41,7 +41,6 @@ export default async function userPropertiesController(
         return reply.status(400).send(result.error);
       }
       const resource = result.value;
-
       return reply.status(200).send(resource);
     },
   );
@@ -84,27 +83,46 @@ export default async function userPropertiesController(
       },
     },
     async (request, reply) => {
-      const { id }: DeleteUserPropertyRequest = request.body;
+      const { workspaceId, id }: DeleteUserPropertyRequest = request.body;
 
-      const result = await db()
-        .delete(schema.userProperty)
-        .where(
-          and(
-            eq(schema.userProperty.id, id),
-            not(
-              inArray(
-                schema.userProperty.name,
-                Array.from(protectedUserProperties),
-              ),
-            ),
-          ),
-        )
-        .returning();
-      if (!result.length) {
+      const deleted = await deleteUserProperty({ workspaceId, id });
+      if (!deleted) {
         return reply.status(404).send();
       }
 
       return reply.status(204).send();
+    },
+  );
+
+  fastify.withTypeProvider<TypeBoxTypeProvider>().patch(
+    "/status",
+    {
+      schema: {
+        description: "Update user property status.",
+        tags: ["User Properties"],
+        body: UpdateUserPropertyStatusRequest,
+        response: {
+          200: SavedUserPropertyResource,
+          400: UpdateUserPropertyStatusError,
+          404: EmptyResponse,
+        },
+      },
+    },
+    async (request, reply) => {
+      const { workspaceId, id, status }: UpdateUserPropertyStatusRequest =
+        request.body;
+
+      const result = await updateUserPropertyStatus({
+        workspaceId,
+        id,
+        status,
+      });
+
+      if (result.isErr()) {
+        return reply.status(400).send(result.error);
+      }
+
+      return reply.status(200).send(result.value);
     },
   );
 }

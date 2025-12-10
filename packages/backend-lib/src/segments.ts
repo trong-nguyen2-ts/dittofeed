@@ -3,7 +3,10 @@ import { Static, Type } from "@sinclair/typebox";
 import { ValueError } from "@sinclair/typebox/errors";
 import { format } from "date-fns";
 import { and, eq, inArray, InferSelectModel, not, SQL } from "drizzle-orm";
+import deepEqual from "fast-deep-equal";
 import { CHANNEL_IDENTIFIERS } from "isomorphic-lib/src/channels";
+import { stableJsonStringify } from "isomorphic-lib/src/equality";
+import { doesEventNameMatch } from "isomorphic-lib/src/events";
 import {
   schemaValidate,
   schemaValidateWithErr,
@@ -11,15 +14,16 @@ import {
 import { assertUnreachable } from "isomorphic-lib/src/typeAssertions";
 import { err, ok, Result } from "neverthrow";
 import { PostgresError } from "pg-error-enum";
-import { validate as validateUuid } from "uuid";
+import { v5 as uuidv5, validate as validateUuid } from "uuid";
 
 import {
   clickhouseClient,
   ClickHouseQueryBuilder,
+  command as chCommand,
   query as chQuery,
 } from "./clickhouse";
 import { assignmentSequentialConsistency } from "./config";
-import { db, queryResult } from "./db";
+import { db, TxQueryError, txQueryResult } from "./db";
 import {
   segment as dbSegment,
   subscriptionGroup as dbSubscriptionGroup,
@@ -27,6 +31,7 @@ import {
 import { jsonValue } from "./jsonPath";
 import logger from "./logger";
 import {
+  DeleteSegmentRequest,
   EnrichedSegment,
   InternalEventType,
   JsonResult,
@@ -41,6 +46,9 @@ import {
   SegmentNode,
   SegmentNodeType,
   SegmentOperatorType,
+  SegmentStatus,
+  SegmentStatusEnum,
+  UpdateSegmentStatusRequest,
   UpsertSegmentResource,
   UpsertSegmentValidationError,
   UpsertSegmentValidationErrorType,
@@ -106,6 +114,71 @@ export async function findAllSegmentAssignmentsByIds({
   }));
 }
 
+export async function findAllSegmentAssignmentsByIdsForUsers({
+  workspaceId,
+  segmentIds,
+  userIds,
+}: {
+  workspaceId: string;
+  segmentIds: string[];
+  userIds: string[];
+}): Promise<Record<string, { segmentId: string; inSegment: boolean }[]>> {
+  if (userIds.length === 0 || segmentIds.length === 0) {
+    return {};
+  }
+
+  const qb = new ClickHouseQueryBuilder();
+  const workspaceIdParam = qb.addQueryValue(workspaceId, "String");
+  const query = `
+    SELECT
+      user_id,
+      computed_property_id,
+      argMax(segment_value, assigned_at) as latest_segment_value
+    FROM computed_property_assignments_v2
+    WHERE
+      workspace_id = ${workspaceIdParam}
+      AND type = 'segment'
+      AND user_id IN ${qb.addQueryValue(userIds, "Array(String)")}
+      AND computed_property_id IN ${qb.addQueryValue(segmentIds, "Array(String)")}
+    GROUP BY user_id, computed_property_id
+  `;
+
+  const result = await chQuery({
+    query,
+    query_params: qb.getQueries(),
+    clickhouse_settings: {
+      select_sequential_consistency: assignmentSequentialConsistency(),
+    },
+  });
+  const rows = await result.json<{
+    user_id: string;
+    computed_property_id: string;
+    latest_segment_value: boolean;
+  }>();
+
+  // Initialize results safely for all users
+  const resultsByUser: Record<
+    string,
+    { segmentId: string; inSegment: boolean }[]
+  > = {};
+  userIds.forEach((userId) => {
+    resultsByUser[userId] = [];
+  });
+
+  // Populate results safely without non-null assertions
+  rows.forEach((row) => {
+    const userResults = resultsByUser[row.user_id];
+    if (userResults) {
+      userResults.push({
+        segmentId: row.computed_property_id,
+        inSegment: row.latest_segment_value,
+      });
+    }
+  });
+
+  return resultsByUser;
+}
+
 export async function findAllSegmentAssignments({
   workspaceId,
   userId,
@@ -116,7 +189,10 @@ export async function findAllSegmentAssignments({
   segmentIds?: string[];
 }): Promise<Record<string, boolean | null>> {
   const segments = await db().query.segment.findMany({
-    where: eq(dbSegment.workspaceId, workspaceId),
+    where: and(
+      eq(dbSegment.workspaceId, workspaceId),
+      segmentIds ? inArray(dbSegment.id, segmentIds) : undefined,
+    ),
   });
   const qb = new ClickHouseQueryBuilder();
   const workspaceIdParam = qb.addQueryValue(workspaceId, "String");
@@ -124,6 +200,7 @@ export async function findAllSegmentAssignments({
   const segmentIdsClause = segmentIds
     ? `AND computed_property_id IN ${qb.addQueryValue(segmentIds, "Array(String)")}`
     : "";
+
   const query = `
     SELECT
       computed_property_id,
@@ -197,6 +274,7 @@ export function toSegmentResource(
     updatedAt: segment.updatedAt.getTime(),
     definitionUpdatedAt: segment.definitionUpdatedAt.getTime(),
     createdAt: segment.createdAt.getTime(),
+    status: segment.status,
   });
 }
 
@@ -339,6 +417,22 @@ export async function findManySegmentResourcesSafe({
   return results;
 }
 
+export async function findSegmentResource({
+  workspaceId,
+  id,
+}: {
+  workspaceId: string;
+  id: string;
+}): Promise<Result<SavedSegmentResource | null, Error>> {
+  const segment = await db().query.segment.findFirst({
+    where: and(eq(dbSegment.workspaceId, workspaceId), eq(dbSegment.id, id)),
+  });
+  if (!segment) {
+    return ok(null);
+  }
+  return toSegmentResource(segment);
+}
+
 /**
  * Upsert segment resource if the existing segment is not internal.
  * @param segment
@@ -354,34 +448,138 @@ export async function upsertSegment(
     });
   }
 
-  const value: typeof dbSegment.$inferInsert = {
-    id: params.id,
-    workspaceId: params.workspaceId,
-    name: params.name,
-    definition: params.definition,
-  };
+  const txResult: Result<Segment, TxQueryError> = await db().transaction(
+    async (tx) => {
+      const findFirstConditions: SQL[] = [
+        eq(dbSegment.workspaceId, params.workspaceId),
+      ];
+      if (params.id) {
+        findFirstConditions.push(eq(dbSegment.id, params.id));
+      } else {
+        findFirstConditions.push(eq(dbSegment.name, params.name));
+      }
+      const existingSegment = await tx.query.segment.findFirst({
+        where: and(...findFirstConditions),
+      });
+      if (existingSegment) {
+        if (params.createOnly) {
+          return ok(existingSegment);
+        }
+        const wasDefinitionUpdated =
+          params.definition &&
+          !deepEqual(existingSegment.definition, params.definition);
 
-  const result = await queryResult(
-    db()
-      .insert(dbSegment)
-      .values(value)
-      .onConflictDoUpdate({
-        target: params.id
-          ? [dbSegment.id]
-          : [dbSegment.workspaceId, dbSegment.name],
-        setWhere: eq(dbSegment.workspaceId, params.workspaceId),
-        set: {
-          definition: params.definition,
-          name: params.name,
-          definitionUpdatedAt: params.definition ? new Date() : undefined,
-        },
-      })
-      .returning(),
+        const existingDefinitionResult = schemaValidateWithErr(
+          existingSegment.definition,
+          SegmentDefinition,
+        );
+        if (existingDefinitionResult.isErr()) {
+          logger().error(
+            {
+              err: existingDefinitionResult.error,
+              segment: existingSegment,
+              workspaceId: params.workspaceId,
+            },
+            "Existing segment definition is invalid",
+          );
+          throw new Error("Existing segment definition is invalid");
+        }
+
+        const wasPreviouslyManual =
+          existingDefinitionResult.value.entryNode.type ===
+          SegmentNodeType.Manual;
+
+        let willBeManual: boolean;
+        if (params.definition) {
+          willBeManual =
+            params.definition.entryNode.type === SegmentNodeType.Manual;
+        } else {
+          willBeManual =
+            existingDefinitionResult.value.entryNode.type ===
+            SegmentNodeType.Manual;
+        }
+        let status: SegmentStatus;
+        // Ensure manual segments are not started. They're updated imperatively.
+        if (willBeManual) {
+          status = SegmentStatusEnum.NotStarted;
+        } else if (params.status) {
+          status = params.status;
+          // If the segment was previously manual, and is now not, we need to start it.
+        } else if (wasPreviouslyManual) {
+          status = SegmentStatusEnum.Running;
+        } else {
+          status = existingSegment.status;
+        }
+
+        const updateResult = await txQueryResult(
+          tx
+            .update(dbSegment)
+            .set({
+              definition: params.definition,
+              name: params.name,
+              resourceType: params.resourceType,
+              definitionUpdatedAt: wasDefinitionUpdated
+                ? new Date()
+                : existingSegment.definitionUpdatedAt,
+              status,
+            })
+            .where(eq(dbSegment.id, existingSegment.id))
+            .returning(),
+        );
+        if (updateResult.isErr()) {
+          return err(updateResult.error);
+        }
+        const updatedSegment = updateResult.value[0];
+        if (!updatedSegment) {
+          logger().error(
+            {
+              workspaceId: params.workspaceId,
+              segmentId: existingSegment.id,
+            },
+            "segment not found",
+          );
+          throw new Error("segment not found");
+        }
+        return ok(updatedSegment);
+      }
+
+      const status =
+        params.definition?.entryNode.type === SegmentNodeType.Manual
+          ? SegmentStatusEnum.NotStarted
+          : params.status;
+      const value: typeof dbSegment.$inferInsert = {
+        id: params.id,
+        workspaceId: params.workspaceId,
+        name: params.name,
+        definition: params.definition,
+        resourceType: params.resourceType,
+        status,
+      };
+
+      const createResult = await txQueryResult(
+        tx.insert(dbSegment).values(value).returning(),
+      );
+      if (createResult.isErr()) {
+        return err(createResult.error);
+      }
+      const createdSegment = createResult.value[0];
+      if (!createdSegment) {
+        logger().error(
+          {
+            workspaceId: params.workspaceId,
+            name: params.name,
+          },
+          "segment not found",
+        );
+        throw new Error("segment not found");
+      }
+      return ok(createdSegment);
+    },
   );
-  if (result.isErr()) {
+  if (txResult.isErr()) {
     if (
-      result.error.code === PostgresError.FOREIGN_KEY_VIOLATION ||
-      result.error.code === PostgresError.UNIQUE_VIOLATION
+      txResult.error.code === PostgresError.FOREIGN_KEY_VIOLATION ||
+      txResult.error.code === PostgresError.UNIQUE_VIOLATION
     ) {
       return err({
         type: UpsertSegmentValidationErrorType.UniqueConstraintViolation,
@@ -391,33 +589,25 @@ export async function upsertSegment(
     }
     logger().error(
       {
-        result,
+        err: txResult.error,
         params,
-        err: result.error,
-        workspaceId: params.workspaceId,
       },
       "Failed to upsert segment",
     );
-    throw result.error;
+    throw txResult.error;
   }
-
-  const insertedSegment = result.value[0];
-  if (!insertedSegment) {
-    return err({
-      type: UpsertSegmentValidationErrorType.UniqueConstraintViolation,
-      message:
-        "Names must be unique in workspace. Id's must be globally unique.",
-    });
-  }
+  const segment = txResult.value;
 
   return ok({
-    id: insertedSegment.id,
-    workspaceId: insertedSegment.workspaceId,
-    name: insertedSegment.name,
-    definition: insertedSegment.definition as SegmentDefinition,
-    definitionUpdatedAt: insertedSegment.definitionUpdatedAt.getTime(),
-    updatedAt: insertedSegment.updatedAt.getTime(),
-    createdAt: insertedSegment.createdAt.getTime(),
+    id: segment.id,
+    workspaceId: segment.workspaceId,
+    name: segment.name,
+    definition: segment.definition as SegmentDefinition,
+    definitionUpdatedAt: segment.definitionUpdatedAt.getTime(),
+    updatedAt: segment.updatedAt.getTime(),
+    createdAt: segment.createdAt.getTime(),
+    resourceType: segment.resourceType,
+    status: segment.status,
   });
 }
 
@@ -597,6 +787,7 @@ export async function findManyPartialSegments({
       updatedAt,
       definitionUpdatedAt,
       createdAt,
+      resourceType,
     } = segment;
     return {
       id,
@@ -606,6 +797,7 @@ export async function findManyPartialSegments({
       updatedAt: updatedAt.getTime(),
       definitionUpdatedAt: definitionUpdatedAt.getTime(),
       createdAt: createdAt.getTime(),
+      resourceType,
     } satisfies PartialSegmentResource;
   });
 }
@@ -642,7 +834,7 @@ function filterEvent(
   },
   e: UserWorkflowTrackEvent,
 ): boolean {
-  if (e.event !== event) {
+  if (!doesEventNameMatch({ pattern: event, event: e.event })) {
     logger().debug(
       {
         event,
@@ -712,14 +904,12 @@ function filterEvent(
         mismatched = Number.isNaN(numValue) || numValue < operator.value;
         break;
       }
+      case SegmentOperatorType.NotEquals: {
+        mismatched = value === operator.value;
+        break;
+      }
       default:
-        logger().error(
-          {
-            operator,
-          },
-          "unsupported operator",
-        );
-        return false;
+        assertUnreachable(operator);
     }
 
     if (mismatched) {
@@ -882,4 +1072,129 @@ export async function getSegmentAssignmentDb({
   });
   const rows = await result.json<{ latest_segment_value: boolean }>();
   return rows[0]?.latest_segment_value ?? null;
+}
+
+export async function updateSegmentStatus({
+  workspaceId,
+  id,
+  status,
+}: UpdateSegmentStatusRequest): Promise<
+  Result<SavedSegmentResource | null, Error>
+> {
+  return db().transaction(async (tx) => {
+    // Fetch the segment to check if it's manual
+    const segment = await tx.query.segment.findFirst({
+      where: and(eq(dbSegment.workspaceId, workspaceId), eq(dbSegment.id, id)),
+    });
+
+    if (!segment) {
+      return ok(null);
+    }
+
+    // Check if the segment definition is valid and if it's a manual segment
+    const definitionResult = schemaValidateWithErr(
+      segment.definition,
+      SegmentDefinition,
+    );
+    if (definitionResult.isErr()) {
+      logger().error(
+        { err: definitionResult.error, workspaceId, id },
+        "failed to validate segment definition when updating status",
+      );
+      throw definitionResult.error;
+    }
+
+    const isManual =
+      definitionResult.value.entryNode.type === SegmentNodeType.Manual;
+    if (isManual) {
+      return err(new Error("Cannot change status of a manual segment"));
+    }
+
+    const [updated] = await tx
+      .update(dbSegment)
+      .set({ status })
+      .where(and(eq(dbSegment.workspaceId, workspaceId), eq(dbSegment.id, id)))
+      .returning();
+
+    if (!updated) {
+      return err(new Error("Failed to update segment status"));
+    }
+
+    const result = toSegmentResource(updated);
+    if (result.isErr()) {
+      logger().error(
+        { err: result.error, workspaceId, id },
+        "failed to convert segment to resource after status update",
+      );
+      return err(result.error);
+    }
+
+    return ok(result.value);
+  });
+}
+
+export async function deleteSegment({
+  workspaceId,
+  id,
+}: DeleteSegmentRequest): Promise<Segment | null> {
+  const [deleted] = await db()
+    .delete(dbSegment)
+    .where(and(eq(dbSegment.id, id), eq(dbSegment.workspaceId, workspaceId)))
+    .returning();
+
+  if (!deleted) {
+    return null;
+  }
+
+  const qb = new ClickHouseQueryBuilder();
+  const workspaceIdParam = qb.addQueryValue(workspaceId, "String");
+  const segmentIdParam = qb.addQueryValue(id, "String");
+  const typeParam = qb.addQueryValue("segment", "String");
+
+  const queries = [
+    `DELETE FROM computed_property_state_v3 WHERE workspace_id = ${workspaceIdParam}
+     AND type = ${typeParam}
+     AND computed_property_id = ${segmentIdParam} settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
+    `DELETE FROM computed_property_assignments_v2 WHERE workspace_id = ${workspaceIdParam}
+     AND type = ${typeParam}
+     AND computed_property_id = ${segmentIdParam} settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
+    `DELETE FROM processed_computed_properties_v2 WHERE workspace_id = ${workspaceIdParam}
+     AND type = ${typeParam}
+     AND computed_property_id = ${segmentIdParam} settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
+    `DELETE FROM computed_property_state_index WHERE workspace_id = ${workspaceIdParam}
+     AND type = ${typeParam}
+     AND computed_property_id = ${segmentIdParam} settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
+    `DELETE FROM updated_computed_property_state WHERE workspace_id = ${workspaceIdParam}
+     AND type = ${typeParam}
+     AND computed_property_id = ${segmentIdParam} settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
+    `DELETE FROM updated_property_assignments_v2 WHERE workspace_id = ${workspaceIdParam}
+     AND type = ${typeParam}
+     AND computed_property_id = ${segmentIdParam} settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
+    `DELETE FROM resolved_segment_state WHERE workspace_id = ${workspaceIdParam}
+     AND segment_id = ${segmentIdParam} settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
+  ];
+
+  await Promise.all(
+    queries.map((query) =>
+      chCommand({
+        query,
+        query_params: qb.getQueries(),
+      }),
+    ),
+  );
+
+  return deleted;
+}
+
+const SEGMENTS_HASH_NAMESPACE = "cea974fe-c5e9-4fde-a3f1-cea2167be214";
+
+/**
+ * Hash a segment definition to a string to see if segments have equivalent definitions.
+ */
+export function getSegmentsHash({
+  definition,
+}: {
+  definition: SegmentDefinition;
+}): string {
+  return uuidv5(stableJsonStringify(definition), SEGMENTS_HASH_NAMESPACE);
 }

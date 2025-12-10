@@ -4,6 +4,8 @@
 
 workspaceName: Dittofeed
 
+replicaCount: 1
+
 image:
   repository: dittofeed/dittofeed-admin-cli
   pullPolicy: IfNotPresent
@@ -13,6 +15,9 @@ image:
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
+
+separateWorker:
+  enabled: false
 
 serviceAccount:
   # Specifies whether a service account should be created

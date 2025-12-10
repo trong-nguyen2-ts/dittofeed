@@ -16,7 +16,6 @@ import Popover from "@mui/material/Popover";
 import { assertUnreachable } from "isomorphic-lib/src/typeAssertions";
 import {
   ChannelType,
-  CompletionStatus,
   InternalEventType,
   Present,
 } from "isomorphic-lib/src/types";
@@ -24,7 +23,7 @@ import React, { HTMLAttributes, useCallback, useMemo, useRef } from "react";
 import { omit } from "remeda";
 import { Updater, useImmer } from "use-immer";
 
-import { useAppStorePick } from "../../lib/appStore";
+import { useResourcesQuery } from "../../lib/useResourcesQuery";
 import { greyTextFieldStyles } from "../greyScaleStyles";
 import { SquarePaper } from "../squarePaper";
 
@@ -162,6 +161,7 @@ export function SelectedDeliveriesFilters({
           label={`${key} = ${label}`}
           onDelete={() =>
             setState((draft) => {
+              // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
               draft.filters.delete(key as Key);
             })
           }
@@ -183,7 +183,7 @@ export function NewDeliveriesFilterButton({
   setState: SetDeliveriesState;
   greyScale?: boolean;
 }) {
-  const { messages } = useAppStorePick(["messages"]);
+  const { data: resources } = useResourcesQuery({ messageTemplates: true });
   const { stage } = state;
   const inputRef = useRef<HTMLInputElement>(null);
   const anchorEl = useRef<HTMLElement | null>(null);
@@ -263,10 +263,7 @@ export function NewDeliveriesFilterButton({
               draft.inputValue = "";
               switch (value.filterKey) {
                 case "template": {
-                  const templates =
-                    messages.type === CompletionStatus.Successful
-                      ? messages.value
-                      : [];
+                  const templates = resources?.messageTemplates || [];
 
                   const children: SelectItemCommand[] = templates.map(
                     (template) => ({
@@ -337,11 +334,6 @@ export function NewDeliveriesFilterButton({
                       id: InternalEventType.EmailDelivered,
                     },
                     {
-                      label: "Email Bounced",
-                      type: DeliveriesFilterCommandType.SelectItem,
-                      id: InternalEventType.EmailDelivered,
-                    },
-                    {
                       label: "Email Dropped",
                       type: DeliveriesFilterCommandType.SelectItem,
                       id: InternalEventType.EmailDropped,
@@ -398,7 +390,7 @@ export function NewDeliveriesFilterButton({
         }
       }
     },
-    [setState, messages],
+    [setState, resources],
   );
 
   const handleClick = (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -502,6 +494,7 @@ export function NewDeliveriesFilterButton({
           />
         )}
         renderOption={(props, option) => {
+          // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
           const propsWithKey = props as HTMLAttributes<HTMLLIElement> & {
             key: string;
           };

@@ -9,9 +9,16 @@ const RawConfig = Type.Object(
   {
     workerServiceName: Type.Optional(Type.String()),
     reuseContext: Type.Optional(BoolStr),
+    useTemporalVersioning: Type.Optional(BoolStr),
     taskQueue: Type.Optional(Type.String()),
     maxCachedWorkflows: Type.Optional(Type.String({ format: "naturalNumber" })),
     maxConcurrentWorkflowTaskExecutions: Type.Optional(
+      Type.String({ format: "naturalNumber" }),
+    ),
+    maxConcurrentActivityTaskExecutions: Type.Optional(
+      Type.String({ format: "naturalNumber" }),
+    ),
+    maxConcurrentLocalActivityExecutions: Type.Optional(
       Type.String({ format: "naturalNumber" }),
     ),
     maxConcurrentActivityTaskPolls: Type.Optional(
@@ -31,24 +38,34 @@ type Config = Overwrite<
   {
     workerServiceName: string;
     reuseContext: boolean;
+    useTemporalVersioning: boolean;
     maxCachedWorkflows?: number;
     taskQueue: string;
     maxConcurrentWorkflowTaskExecutions?: number;
     maxConcurrentActivityTaskPolls?: number;
     maxConcurrentWorkflowTaskPolls?: number;
+    maxConcurrentActivityTaskExecutions?: number;
+    maxConcurrentLocalActivityExecutions?: number;
   }
 >;
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 function parseRawConfig(raw: RawConfig): Config {
+  let maxCachedWorkflows: number | undefined;
+  if (raw.maxCachedWorkflows) {
+    if (raw.maxCachedWorkflows.toLowerCase() !== "none") {
+      maxCachedWorkflows = parseInt(raw.maxCachedWorkflows);
+    }
+  } else {
+    maxCachedWorkflows = 50;
+  }
   return {
     ...raw,
-    reuseContext: raw.reuseContext === "true",
+    reuseContext: raw.reuseContext !== "false",
+    useTemporalVersioning: raw.useTemporalVersioning === "true",
     workerServiceName: raw.workerServiceName ?? "dittofeed-worker",
     taskQueue: raw.taskQueue ?? "default",
-    maxCachedWorkflows: raw.maxCachedWorkflows
-      ? parseInt(raw.maxCachedWorkflows)
-      : undefined,
+    maxCachedWorkflows,
     maxConcurrentWorkflowTaskExecutions: raw.maxConcurrentWorkflowTaskExecutions
       ? parseInt(raw.maxConcurrentWorkflowTaskExecutions)
       : undefined,
@@ -58,6 +75,13 @@ function parseRawConfig(raw: RawConfig): Config {
     maxConcurrentWorkflowTaskPolls: raw.maxConcurrentWorkflowTaskPolls
       ? parseInt(raw.maxConcurrentWorkflowTaskPolls)
       : undefined,
+    maxConcurrentActivityTaskExecutions: raw.maxConcurrentActivityTaskExecutions
+      ? parseInt(raw.maxConcurrentActivityTaskExecutions)
+      : undefined,
+    maxConcurrentLocalActivityExecutions:
+      raw.maxConcurrentLocalActivityExecutions
+        ? parseInt(raw.maxConcurrentLocalActivityExecutions)
+        : undefined,
   };
 }
 

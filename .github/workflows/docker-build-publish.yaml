@@ -13,12 +13,22 @@ jobs:
 
     runs-on: ubuntu-latest
     steps:
-      - name: Delete huge unnecessary tools folder
-        run: rm -rf /opt/hostedtoolcache
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # Minimize what is removed to keep the action fast,
+          # but remove large items like android and dotnet
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
 
       - name: Print free disk space
         run: df -h
-     
+
       - name: Check out the repo
         uses: actions/checkout@v3
 

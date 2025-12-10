@@ -1,9 +1,10 @@
-import { add } from "date-fns";
-import { getTimezoneOffset } from "date-fns-tz";
+import { add, getUnixTime } from "date-fns";
+import { getTimezoneOffset, zonedTimeToUtc } from "date-fns-tz";
 import { find as findTz } from "geo-tz";
 
 import logger from "./logger";
 import { LocalTimeDelayVariantFields, UserWorkflowTrackEvent } from "./types";
+import { getTrackEventsById } from "./userEvents";
 import {
   findAllUserPropertyAssignments,
   findAllUserPropertyAssignmentsById,
@@ -28,16 +29,29 @@ function getTimezone({ latLon }: { latLon: string }): string {
 
 export function findNextLocalizedTimeInner({
   latLon,
+  userTimezone,
+  defaultTimezone,
   now,
   hour,
   minute = 0,
   allowedDaysOfWeek,
 }: LocalTimeDelayVariantFields & {
   latLon?: string;
+  userTimezone?: string;
   now: number;
 }): number {
-  const timezone =
-    typeof latLon === "string" ? getTimezone({ latLon }) : DEFAULT_TIMEZONE;
+  // Priority: user property timezone > latLon-derived timezone > defaultTimezone > UTC
+  let timezone: string;
+  if (userTimezone) {
+    timezone = userTimezone;
+  } else if (typeof latLon === "string") {
+    timezone = getTimezone({ latLon });
+  } else if (defaultTimezone) {
+    timezone = defaultTimezone;
+  } else {
+    timezone = DEFAULT_TIMEZONE;
+  }
+
   const offset = getTimezoneOffset(timezone, now);
   const zoned = offset + now;
 
@@ -62,6 +76,11 @@ export function findNextLocalizedTimeInner({
   throw new Error("Could not find next localized time");
 }
 
+/**
+ * @deprecated Use findNextLocalizedTimeV2 instead. This function hardcodes hour to 5
+ * and doesn't support custom minutes or allowedDaysOfWeek parameters.
+ * Kept for backwards compatibility with existing temporal workflows.
+ */
 export async function findNextLocalizedTime({
   workspaceId,
   userId,
@@ -83,6 +102,59 @@ export async function findNextLocalizedTime({
   });
 }
 
+export async function findNextLocalizedTimeV2({
+  workspaceId,
+  userId,
+  now,
+  hour,
+  minute,
+  allowedDaysOfWeek,
+  defaultTimezone,
+}: {
+  workspaceId: string;
+  userId: string;
+  now: number;
+} & LocalTimeDelayVariantFields): Promise<number> {
+  const { latLon, timezone } = await findAllUserPropertyAssignments({
+    workspaceId,
+    userId,
+    userProperties: ["latLon", "timezone"],
+  });
+  return findNextLocalizedTimeInner({
+    latLon: typeof latLon === "string" ? latLon : undefined,
+    userTimezone: typeof timezone === "string" ? timezone : undefined,
+    defaultTimezone,
+    now,
+    hour,
+    minute,
+    allowedDaysOfWeek,
+  });
+}
+
+export interface BaseGetUserPropertyDelayParams {
+  workspaceId: string;
+  userId: string;
+  userProperty: string;
+  now: number;
+  offsetSeconds?: number;
+  offsetDirection?: "before" | "after";
+}
+
+export interface GetUserPropertyDelayParamsV1
+  extends BaseGetUserPropertyDelayParams {
+  events?: UserWorkflowTrackEvent[];
+}
+
+export interface GetUserPropertyDelayParamsV2
+  extends BaseGetUserPropertyDelayParams {
+  eventIds: string[];
+  version: "v2";
+}
+
+export type GetUserPropertyDelayParams =
+  | GetUserPropertyDelayParamsV1
+  | GetUserPropertyDelayParamsV2;
+
 /**
  * Returns the delay in milliseconds to wait for a user property delay.
  * Returns null if the user property is not a date.
@@ -101,16 +173,17 @@ export async function getUserPropertyDelay({
   now,
   offsetSeconds = 0,
   offsetDirection = "after",
-  events,
-}: {
-  workspaceId: string;
-  userId: string;
-  userProperty: string;
-  now: number;
-  events?: UserWorkflowTrackEvent[];
-  offsetSeconds?: number;
-  offsetDirection?: "before" | "after";
-}): Promise<number | null> {
+  ...rest
+}: GetUserPropertyDelayParams): Promise<number | null> {
+  let events: UserWorkflowTrackEvent[] | undefined;
+  if ("version" in rest) {
+    events = await getTrackEventsById({
+      workspaceId,
+      eventIds: rest.eventIds,
+    });
+  } else {
+    events = rest.events;
+  }
   const assignments = await findAllUserPropertyAssignmentsById({
     workspaceId,
     userId,
@@ -120,15 +193,6 @@ export async function getUserPropertyDelay({
 
   const assignment = assignments[userProperty];
   if (!assignment) {
-    logger().debug(
-      {
-        workspaceId,
-        userId,
-        userProperty,
-        assignments,
-      },
-      "no assignment in user property delay",
-    );
     return null;
   }
 
@@ -151,15 +215,6 @@ export async function getUserPropertyDelay({
   }
 
   if (!date) {
-    logger().debug(
-      {
-        workspaceId,
-        userId,
-        userProperty,
-        assignment,
-      },
-      "no date in user property delay",
-    );
     return null;
   }
 

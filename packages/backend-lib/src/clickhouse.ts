@@ -80,6 +80,9 @@ export class ClickHouseQueryBuilder {
         case "Float64":
           // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
           return `${value}`;
+        case "UInt64":
+          // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
+          return `${value}`;
         default:
           throw new Error(
             `Unhandled data type in query builder debug mode: ${dataType}`,
@@ -96,7 +99,7 @@ export class ClickHouseQueryBuilder {
    * @returns {string} A clickhouse safe variable name.
    */
   getVariableName(): string {
-    const variable = `v${this.variableCount}`;
+    const variable = `vn${this.variableCount}`;
     this.variableCount += 1;
     return variable;
   }
@@ -104,29 +107,62 @@ export class ClickHouseQueryBuilder {
 
 export interface CreateConfigParams {
   enableSession?: boolean;
+  requestTimeout?: number;
+  maxBytesRatioBeforeExternalGroupBy?: number;
+  maxBytesBeforeExternalGroupBy?: string;
+  host?: string;
+  database?: string;
+  user?: string;
+  password?: string;
 }
 
 function getClientConfig({
   enableSession = false,
+  requestTimeout,
+  maxBytesRatioBeforeExternalGroupBy: maxBytesRatioBeforeExternalGroupByParam,
+  maxBytesBeforeExternalGroupBy: maxBytesBeforeExternalGroupByParam,
+  host: paramsHost,
+  database: paramsDatabase,
+  user: paramsUser,
+  password: paramsPassword,
 }: CreateConfigParams): NodeClickHouseClientConfigOptions {
   const {
-    clickhouseHost: url,
-    clickhouseDatabase: database,
-    clickhouseUser: username,
-    clickhousePassword: password,
-    clickhouseClientRequestTimeout: request_timeout,
+    clickhouseHost: configHost,
+    clickhouseDatabase: configDatabase,
+    clickhouseUser: configUser,
+    clickhousePassword: configPassword,
+    clickhouseClientRequestTimeout,
   } = config();
+
+  const url = paramsHost ?? configHost;
+  const database = paramsDatabase ?? configDatabase;
+  const username = paramsUser ?? configUser;
+  const password = paramsPassword ?? configPassword;
+
+  // Use param if provided, otherwise use custom config, otherwise use default
+  const request_timeout = requestTimeout ?? clickhouseClientRequestTimeout ?? 180000;
+
+  const maxBytesRatioBeforeExternalGroupBy =
+    maxBytesRatioBeforeExternalGroupByParam ??
+    config().clickhouseMaxBytesRatioBeforeExternalGroupBy;
+  const maxBytesBeforeExternalGroupBy =
+    maxBytesBeforeExternalGroupByParam ??
+    config().clickhouseMaxBytesBeforeExternalGroupBy;
 
   const clientConfig: NodeClickHouseClientConfigOptions = {
     url,
     database,
     username,
     password,
-    request_timeout: request_timeout,
+    request_timeout,
     clickhouse_settings: {
+      max_bytes_ratio_before_external_group_by:
+        maxBytesRatioBeforeExternalGroupBy,
+      max_bytes_before_external_group_by: maxBytesBeforeExternalGroupBy,
       date_time_input_format: "best_effort",
     },
   };
+  logger().debug({ clientConfig }, "ClickHouse client config");
   if (enableSession) {
     const sessionId = getChCompatibleUuid();
     logger().info(
@@ -222,8 +258,22 @@ export async function command(
   const queryId = params.query_id ?? getChCompatibleUuid();
   return withSpan({ name: "clickhouse-command" }, async (span) => {
     span.setAttributes({ queryId, query: params.query });
-    logger().trace(`clickhouse-command: ${params.query}`);
-    return client.command({ query_id: queryId, ...params });
+    logger().trace(
+      {
+        queryId,
+        query: params.query,
+      },
+      "clickhouse-command",
+    );
+    try {
+      return client.command({ query_id: queryId, ...params });
+    } catch (error) {
+      logger().error(
+        { err: error, queryId },
+        "Error executing clickhouse command",
+      );
+      throw error;
+    }
   });
 }
 
@@ -239,11 +289,25 @@ export async function query(
   const queryId = params.query_id ?? getChCompatibleUuid();
   return withSpan({ name: "clickhouse-query" }, async (span) => {
     span.setAttributes({ queryId, query: params.query });
-    logger().trace(`clickhouse-query: ${params.query}`);
-    return client.query<"JSONEachRow">({
-      query_id: queryId,
-      ...params,
-      format: "JSONEachRow",
-    });
+    logger().trace(
+      {
+        queryId,
+        query: params.query,
+      },
+      "clickhouse-query",
+    );
+    try {
+      return client.query<"JSONEachRow">({
+        query_id: queryId,
+        ...params,
+        format: "JSONEachRow",
+      });
+    } catch (error) {
+      logger().error(
+        { err: error, queryId },
+        "Error executing clickhouse query",
+      );
+      throw error;
+    }
   });
 }

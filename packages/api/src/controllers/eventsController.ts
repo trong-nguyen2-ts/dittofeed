@@ -1,5 +1,6 @@
 import { TypeBoxTypeProvider } from "@fastify/type-provider-typebox";
 import {
+  DownloadEventsRequest,
   GetEventsRequest,
   GetEventsResponse,
   GetEventsResponseItem,
@@ -9,6 +10,7 @@ import {
   GetTraitsResponse,
 } from "backend-lib/src/types";
 import {
+  buildEventsFile,
   findIdentifyTraits,
   findManyEventsWithCount,
   findTrackProperties,
@@ -30,24 +32,17 @@ export default async function eventsController(fastify: FastifyInstance) {
       },
     },
     async (request, reply) => {
-      const {
-        workspaceId,
-        limit,
-        offset,
-        startDate,
-        endDate,
-        userId,
-        searchTerm,
-      } = request.query;
+      // Create an AbortController that will be aborted when the request is closed
+      const abortController = new AbortController();
+
+      // Abort the controller when the request connection is closed
+      request.raw.on("close", () => {
+        abortController.abort();
+      });
 
       const { events: eventsRaw, count } = await findManyEventsWithCount({
-        workspaceId,
-        limit,
-        offset,
-        startDate,
-        endDate,
-        userId,
-        searchTerm,
+        ...request.query,
+        abortSignal: abortController.signal,
       });
 
       const events: GetEventsResponseItem[] = eventsRaw.flatMap(
@@ -59,17 +54,9 @@ export default async function eventsController(fastify: FastifyInstance) {
           anonymous_id,
           event,
           event_time,
-          traits,
           properties,
         }) => {
-          let colsolidatedTraits: string;
-          if (traits.length) {
-            colsolidatedTraits = traits;
-          } else if (properties.length) {
-            colsolidatedTraits = properties;
-          } else {
-            colsolidatedTraits = "{}";
-          }
+          const colsolidatedTraits = properties.length ? properties : "{}";
           return {
             messageId: message_id,
             processingTime: processing_time,
@@ -126,6 +113,29 @@ export default async function eventsController(fastify: FastifyInstance) {
         workspaceId: request.query.workspaceId,
       });
       return reply.status(200).send({ properties });
+    },
+  );
+
+  fastify.withTypeProvider<TypeBoxTypeProvider>().get(
+    "/download",
+    {
+      schema: {
+        description: "Download a csv containing events.",
+        tags: ["Events"],
+        querystring: DownloadEventsRequest,
+        200: {
+          type: "string",
+          format: "binary",
+        },
+      },
+    },
+    async (request, reply) => {
+      const { fileName, fileContent } = await buildEventsFile(request.query);
+
+      return reply
+        .header("Content-Disposition", `attachment; filename=${fileName}`)
+        .type("text/csv")
+        .send(fileContent);
     },
   );
 }

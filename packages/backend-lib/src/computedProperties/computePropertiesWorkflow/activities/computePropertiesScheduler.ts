@@ -4,7 +4,11 @@ import {
   computePropertiesQueueWorkflow,
   getQueueSizeQuery,
 } from "../../computePropertiesQueueWorkflow";
-import { findDueWorkspaceMaxTos, FindDueWorkspacesParams } from "../../periods";
+import {
+  findDueWorkspaceMaxTos,
+  findDueWorkspaceMinTos,
+  FindDueWorkspacesParams,
+} from "../../periods";
 
 export async function findDueWorkspaces(
   params: FindDueWorkspacesParams,
@@ -15,10 +19,44 @@ export async function findDueWorkspaces(
   };
 }
 
+export interface DueWorkspace {
+  id: string;
+  maxPeriod?: number;
+}
+
+export async function findDueWorkspacesV2(
+  params: FindDueWorkspacesParams,
+): Promise<{ workspaces: DueWorkspace[] }> {
+  const maxTos = await findDueWorkspaceMaxTos(params);
+  return {
+    workspaces: maxTos.map(({ workspaceId, max }) => ({
+      id: workspaceId,
+      maxPeriod: max?.getTime(),
+    })),
+  };
+}
+
 export async function getQueueSize(): Promise<number> {
   const client = await connectClient();
   const handle = client.workflow.getHandle<
     typeof computePropertiesQueueWorkflow
   >(COMPUTE_PROPERTIES_QUEUE_WORKFLOW_ID);
   return handle.query(getQueueSizeQuery);
+}
+
+export interface DueWorkspaceV3 {
+  id: string;
+  minPeriod?: number;
+}
+
+export async function findDueWorkspacesV3(
+  params: FindDueWorkspacesParams,
+): Promise<{ workspaces: DueWorkspaceV3[] }> {
+  const minTos = await findDueWorkspaceMinTos(params);
+  return {
+    workspaces: minTos.map(({ workspaceId, min }) => ({
+      id: workspaceId,
+      minPeriod: min?.getTime(),
+    })),
+  };
 }

@@ -1,7 +1,11 @@
 import { Static, TSchema, Type } from "@sinclair/typebox";
 import { Result } from "neverthrow";
 
-import { SEGMENT_ID_HEADER, WORKSPACE_ID_HEADER } from "./constants/headers";
+import {
+  MANUAL_SEGMENT_APPEND_HEADER,
+  SEGMENT_ID_HEADER,
+  WORKSPACE_ID_HEADER,
+} from "./constants/headers";
 
 export type Present<T> = T extends undefined | null ? never : T;
 
@@ -36,7 +40,7 @@ export const Nullable = <T extends TSchema>(type: T) =>
   Type.Union([type, Type.Null()]);
 
 export const NullableAndOptional = <T extends TSchema>(type: T) =>
-  Type.Union([Type.Null(), Type.Optional(type)]);
+  Type.Optional(Type.Union([Type.Null(), type]));
 
 export type JSONValue =
   | string
@@ -45,6 +49,28 @@ export type JSONValue =
   | boolean
   | { [x: string]: JSONValue }
   | JSONValue[];
+
+export const IdOrName = Type.Union([
+  Type.Object({
+    id: Type.String(),
+    name: Type.Optional(Type.String()),
+  }),
+  Type.Object({
+    name: Type.String(),
+    id: Type.Optional(Type.String()),
+  }),
+]);
+
+export type IdOrName = Static<typeof IdOrName>;
+
+export const ResourceTypeEnum = {
+  Declarative: "Declarative",
+  Internal: "Internal",
+} as const;
+
+export const ResourceType = Type.KeyOf(Type.Const(ResourceTypeEnum));
+
+export type ResourceType = Static<typeof ResourceType>;
 
 export enum EventType {
   Identify = "identify",
@@ -65,6 +91,7 @@ export enum InternalEventType {
   EmailDropped = "DFEmailDropped",
   EmailDelivered = "DFEmailDelivered",
   EmailOpened = "DFEmailOpened",
+  EmailProcessed = "DFEmailProcessed",
   EmailClicked = "DFEmailClicked",
   EmailBounced = "DFEmailBounced",
   EmailMarkedSpam = "DFEmailMarkedSpam",
@@ -76,6 +103,23 @@ export enum InternalEventType {
   UserTrackSignal = "DFUserTrackSignal",
   GroupUserAssignment = "DFGroupUserAssignment",
   UserGroupAssignment = "DFUserGroupAssignment",
+  JourneyEarlyExit = "DFJourneyEarlyExit",
+}
+
+export const StatusEventsList = [
+  InternalEventType.EmailDropped,
+  InternalEventType.EmailDelivered,
+  InternalEventType.EmailOpened,
+  InternalEventType.EmailClicked,
+  InternalEventType.EmailBounced,
+  InternalEventType.EmailMarkedSpam,
+  InternalEventType.SmsDelivered,
+  InternalEventType.SmsFailed,
+] as const;
+
+export enum CursorDirectionEnum {
+  After = "after",
+  Before = "before",
 }
 
 export enum SubscriptionGroupType {
@@ -90,19 +134,41 @@ export const ChannelType = {
   Webhook: "Webhook",
 } as const;
 
-export enum EmailProviderType {
-  Sendgrid = "SendGrid",
-  AmazonSes = "AmazonSes",
-  Resend = "Resend",
-  PostMark = "PostMark",
-  Smtp = "Smtp",
-  Test = "Test",
-  MailChimp = "MailChimp",
-}
+export const EmailProviderType = {
+  SendGrid: "SendGrid",
+  AmazonSes: "AmazonSes",
+  Resend: "Resend",
+  PostMark: "PostMark",
+  Smtp: "Smtp",
+  Test: "Test",
+  MailChimp: "MailChimp",
+  Gmail: "Gmail",
+} as const;
 
-export const EmailProviderTypeSchema = Type.Enum(EmailProviderType);
+export const EmailProviderTypeSchema = Type.KeyOf(
+  Type.Const(EmailProviderType),
+);
 
 export type EmailProviderTypeSchema = Static<typeof EmailProviderTypeSchema>;
+
+export const WorkspaceWideEmailProviderType = {
+  SendGrid: EmailProviderType.SendGrid,
+  AmazonSes: EmailProviderType.AmazonSes,
+  Resend: EmailProviderType.Resend,
+  PostMark: EmailProviderType.PostMark,
+  Smtp: EmailProviderType.Smtp,
+  Test: EmailProviderType.Test,
+  MailChimp: EmailProviderType.MailChimp,
+} as const;
+
+// Providers that are configured at the workspace level, not the member level.
+export const WorkspaceWideEmailProviders = Type.KeyOf(
+  Type.Const(WorkspaceWideEmailProviderType),
+);
+
+export type WorkspaceWideEmailProviders = Static<
+  typeof WorkspaceWideEmailProviders
+>;
 
 export enum MobilePushProviderType {
   Firebase = "Firebase",
@@ -113,6 +179,7 @@ export type ChannelType = (typeof ChannelType)[keyof typeof ChannelType];
 
 export enum SmsProviderType {
   Twilio = "Twilio",
+  SignalWire = "SignalWire",
   Test = "Test",
 }
 
@@ -169,6 +236,7 @@ export enum SegmentOperatorType {
   NotExists = "NotExists",
   GreaterThanOrEqual = "GreaterThanOrEqual",
   LessThan = "LessThan",
+  AbsoluteTimestamp = "AbsoluteTimestamp",
 }
 
 export enum SegmentHasBeenOperatorComparator {
@@ -191,6 +259,16 @@ export const SegmentWithinOperator = Type.Object({
 });
 
 export type SegmentWithinOperator = Static<typeof SegmentWithinOperator>;
+
+export const SegmentAbsoluteTimestampOperator = Type.Object({
+  type: Type.Literal(SegmentOperatorType.AbsoluteTimestamp),
+  absoluteTimestamp: Type.String(),
+  direction: Type.Enum(CursorDirectionEnum),
+});
+
+export type SegmentAbsoluteTimestampOperator = Static<
+  typeof SegmentAbsoluteTimestampOperator
+>;
 
 export const ExistsOperator = Type.Object({
   type: Type.Literal(SegmentOperatorType.Exists),
@@ -236,6 +314,7 @@ export type SegmentLessThanOperator = Static<typeof SegmentLessThanOperator>;
 
 export const SegmentOperator = Type.Union([
   SegmentWithinOperator,
+  SegmentAbsoluteTimestampOperator,
   SegmentEqualsOperator,
   SegmentNotEqualsOperator,
   SegmentHasBeenOperator,
@@ -260,6 +339,7 @@ export enum SegmentNodeType {
   RandomBucket = "RandomBucket",
   KeyedPerformed = "KeyedPerformed",
   Everyone = "Everyone",
+  Includes = "Includes",
 }
 
 export const DBResourceTypeEnum = {
@@ -299,13 +379,21 @@ export enum RelationalOperators {
   LessThan = "<",
 }
 
+export enum TimeOperator {
+  Within = "Within",
+  AfterAbsolute = "AfterAbsolute",
+  BeforeAbsolute = "BeforeAbsolute",
+}
+
 export const PerformedSegmentNode = Type.Object({
   type: Type.Literal(SegmentNodeType.Performed),
   id: Type.String(),
   event: Type.String(),
   times: Type.Optional(Type.Number()),
   timesOperator: Type.Optional(Type.Enum(RelationalOperators)),
+  timeOperator: Type.Optional(Type.Enum(TimeOperator)),
   withinSeconds: Type.Optional(Type.Number()),
+  absoluteTimestamp: Type.Optional(Type.String()),
   properties: Type.Optional(
     Type.Array(
       Type.Object({
@@ -422,8 +510,18 @@ export const EveryoneSegmentNode = Type.Object({
 
 export type EveryoneSegmentNode = Static<typeof EveryoneSegmentNode>;
 
+export const IncludesSegmentNode = Type.Object({
+  type: Type.Literal(SegmentNodeType.Includes),
+  id: Type.String(),
+  path: Type.String(),
+  item: Type.String(),
+});
+
+export type IncludesSegmentNode = Static<typeof IncludesSegmentNode>;
+
 export const KeyedPerformedPropertiesOperator = Type.Union([
   SegmentEqualsOperator,
+  SegmentNotEqualsOperator,
   ExistsOperator,
   SegmentGreaterThanOrEqualOperator,
   SegmentLessThanOperator,
@@ -465,6 +563,7 @@ export const BodySegmentNode = Type.Union([
   BroadcastSegmentNode,
   SubscriptionGroupSegmentNode,
   RandomBucketSegmentNode,
+  IncludesSegmentNode,
 ]);
 
 export type BodySegmentNode = Static<typeof BodySegmentNode>;
@@ -768,7 +867,7 @@ export enum JourneyNodeType {
   SegmentSplitNode = "SegmentSplitNode",
   MessageNode = "MessageNode",
   RateLimitNode = "RateLimitNode",
-  ExperimentSplitNode = "ExperimentSplitNode",
+  RandomCohortNode = "RandomCohortNode",
   ExitNode = "ExitNode",
   // Inconsistent naming is for backwards compatibility.
   SegmentEntryNode = "EntryNode",
@@ -853,11 +952,6 @@ export const SortDirection = Type.KeyOf(Type.Const(SortDirectionEnum));
 
 export type SortDirection = Static<typeof SortDirection>;
 
-export enum CursorDirectionEnum {
-  After = "after",
-  Before = "before",
-}
-
 export enum DelayVariantType {
   Second = "Second",
   LocalTime = "LocalTime",
@@ -897,6 +991,7 @@ export const LocalTimeDelayVariant = Type.Object({
   minute: Type.Optional(Type.Number()),
   hour: Type.Number(),
   allowedDaysOfWeek: Type.Optional(Type.Array(AllowedDayIndices)),
+  defaultTimezone: Type.Optional(Type.String()),
   // TODO support additional time units
 });
 
@@ -945,7 +1040,7 @@ export type RateLimitNode = Static<typeof RateLimitNode>;
 export const EmailMessageVariant = Type.Object({
   type: Type.Literal(ChannelType.Email),
   templateId: Type.String(),
-  providerOverride: Type.Optional(Type.Enum(EmailProviderType)),
+  providerOverride: Type.Optional(WorkspaceWideEmailProviders),
 });
 
 export type EmailMessageVariant = Static<typeof EmailMessageVariant>;
@@ -996,6 +1091,24 @@ export const TwilioOverride = Type.Object({
 
 export type TwilioOverride = Static<typeof TwilioOverride>;
 
+export enum SignalWireSenderOverrideType {
+  PhoneNumber = "PhoneNumber",
+}
+
+export const SignalWireSenderOverride = Type.Object({
+  type: Type.Literal(SignalWireSenderOverrideType.PhoneNumber),
+  phone: Type.String(),
+});
+
+export type SignalWireSenderOverride = Static<typeof SignalWireSenderOverride>;
+
+export const SignalWireOverride = Type.Object({
+  providerOverride: Type.Literal(SmsProviderType.SignalWire),
+  senderOverride: Type.Optional(SignalWireSenderOverride),
+});
+
+export type SignalWireOverride = Static<typeof SignalWireOverride>;
+
 export const TestSmsOverride = Type.Object({
   providerOverride: Type.Literal(SmsProviderType.Test),
   senderOverride: Type.Optional(Type.Null()),
@@ -1006,6 +1119,7 @@ export type TestSmsOverride = Static<typeof TestSmsOverride>;
 export const SmsProviderOverride = Type.Union([
   NoSmsProviderOverride,
   TwilioOverride,
+  SignalWireOverride,
   TestSmsOverride,
 ]);
 
@@ -1014,6 +1128,7 @@ export type SmsProviderOverride = Static<typeof SmsProviderOverride>;
 export const SmsMessageVariant = Type.Union([
   Type.Composite([BaseSmsMessageVariant, NoSmsProviderOverride]),
   Type.Composite([BaseSmsMessageVariant, TwilioOverride]),
+  Type.Composite([BaseSmsMessageVariant, SignalWireOverride]),
   Type.Composite([BaseSmsMessageVariant, TestSmsOverride]),
 ]);
 
@@ -1044,6 +1159,10 @@ export const MessageNode = Type.Object(
     variant: MessageVariant,
     child: Type.String(),
     syncProperties: Type.Optional(Type.Boolean()),
+    skipOnFailure: Type.Optional(Type.Boolean()),
+    retryCount: Type.Optional(
+      Type.Number({ description: "Number of retry attempts (default: 3)" }),
+    ),
   },
   {
     title: "Message Node",
@@ -1084,19 +1203,31 @@ export const SegmentSplitNode = Type.Object(
 
 export type SegmentSplitNode = Static<typeof SegmentSplitNode>;
 
-export const ExperimentSplitNode = Type.Object(
+export const RandomCohortChild = Type.Object({
+  id: Type.String({ description: "The id of the child node to be split to" }),
+  percent: Type.Number({
+    description:
+      "The percentage of users to be randomly assigned to be in the cohort.",
+  }),
+  name: Type.String(),
+});
+
+export type RandomCohortChild = Static<typeof RandomCohortChild>;
+
+export const RandomCohortNode = Type.Object(
   {
     ...BaseNode,
-    type: Type.Literal(JourneyNodeType.ExperimentSplitNode),
+    type: Type.Literal(JourneyNodeType.RandomCohortNode),
+    children: Type.Array(RandomCohortChild),
   },
   {
-    title: "Experiment Split Node",
+    title: "Random Cohort Node",
     description:
-      "Used to split users among experiment paths, to test their effectiveness.",
+      "Used to split users among random cohorts, to test their effectiveness.",
   },
 );
 
-export type ExperimentSplitNode = Static<typeof ExperimentSplitNode>;
+export type RandomCohortNode = Static<typeof RandomCohortNode>;
 
 export const ExitNode = Type.Object(
   {
@@ -1116,7 +1247,7 @@ export const JourneyBodyNode = Type.Union([
   RateLimitNode,
   SegmentSplitNode,
   MessageNode,
-  ExperimentSplitNode,
+  RandomCohortNode,
   WaitForNode,
 ]);
 
@@ -1134,6 +1265,16 @@ export const JourneyDefinition = Type.Object({
 
 export type JourneyDefinition = Static<typeof JourneyDefinition>;
 
+export const SegmentStatusEnum = {
+  NotStarted: "NotStarted",
+  Running: "Running",
+  Paused: "Paused",
+} as const;
+
+export const SegmentStatus = Type.KeyOf(Type.Const(SegmentStatusEnum));
+
+export type SegmentStatus = Static<typeof SegmentStatus>;
+
 export const SegmentResource = Type.Object({
   id: Type.String(),
   workspaceId: Type.String(),
@@ -1142,6 +1283,8 @@ export const SegmentResource = Type.Object({
   subscriptionGroupId: Type.Optional(Type.String()),
   updatedAt: Type.Number(),
   lastRecomputed: Type.Optional(Type.Number()),
+  resourceType: Type.Optional(ResourceType),
+  status: Type.Optional(SegmentStatus),
 });
 
 export type SegmentResource = Static<typeof SegmentResource>;
@@ -1171,11 +1314,80 @@ export const PartialSegmentResource = Type.Composite([
 
 export type PartialSegmentResource = Static<typeof PartialSegmentResource>;
 
-export const UpsertSubscriptionGroupResource = SubscriptionGroupResource;
+export const UpsertSubscriptionGroupResourceOther = Type.Pick(
+  SubscriptionGroupResource,
+  ["workspaceId", "channel", "type"],
+);
+
+export const SubscriptionGroupUpsertValidationErrorType = {
+  IdError: "IdError",
+  UniqueConstraintViolation: "UniqueConstraintViolation",
+  BadValues: "BadValues",
+} as const;
+
+export const SubscriptionGroupUpsertValidationIdError = Type.Object({
+  type: Type.Literal(SubscriptionGroupUpsertValidationErrorType.IdError),
+  message: Type.String(),
+});
+
+export type SubscriptionGroupUpsertValidationIdError = Static<
+  typeof SubscriptionGroupUpsertValidationIdError
+>;
+
+export const SubscriptionGroupUpsertValidationUniqueConstraintViolation =
+  Type.Object({
+    type: Type.Literal(
+      SubscriptionGroupUpsertValidationErrorType.UniqueConstraintViolation,
+    ),
+    message: Type.String(),
+  });
+
+export type SubscriptionGroupUpsertValidationUniqueConstraintViolation = Static<
+  typeof SubscriptionGroupUpsertValidationUniqueConstraintViolation
+>;
+
+export const SubscriptionGroupUpsertValidationBadValues = Type.Object({
+  type: Type.Literal(SubscriptionGroupUpsertValidationErrorType.BadValues),
+  message: Type.String(),
+});
+
+export type SubscriptionGroupUpsertValidationBadValues = Static<
+  typeof SubscriptionGroupUpsertValidationBadValues
+>;
+
+export const SubscriptionGroupUpsertValidationError = Type.Union([
+  SubscriptionGroupUpsertValidationIdError,
+  SubscriptionGroupUpsertValidationUniqueConstraintViolation,
+  SubscriptionGroupUpsertValidationBadValues,
+]);
+
+export type SubscriptionGroupUpsertValidationError = Static<
+  typeof SubscriptionGroupUpsertValidationError
+>;
+
+export type UpsertSubscriptionGroupResourceOther = Static<
+  typeof UpsertSubscriptionGroupResourceOther
+>;
+
+export const UpsertSubscriptionGroupResource = Type.Composite([
+  IdOrName,
+  UpsertSubscriptionGroupResourceOther,
+]);
 
 export type UpsertSubscriptionGroupResource = Static<
   typeof UpsertSubscriptionGroupResource
 >;
+
+export const BroadcastResourceVersionEnum = {
+  V1: "V1",
+  V2: "V2",
+} as const;
+
+export const BroadcastResourceVersion = Type.KeyOf(
+  Type.Const(BroadcastResourceVersionEnum),
+);
+
+export type BroadcastResourceVersion = Static<typeof BroadcastResourceVersion>;
 
 export const BroadcastResource = Type.Object({
   id: Type.String(),
@@ -1189,9 +1401,11 @@ export const BroadcastResource = Type.Object({
     Type.Literal("InProgress"),
     Type.Literal("Triggered"),
   ]),
+  archived: Type.Optional(Type.Boolean()),
   createdAt: Type.Number(),
   updatedAt: Type.Number(),
   triggeredAt: Type.Optional(Type.Number()),
+  version: Type.Optional(Type.Literal(BroadcastResourceVersionEnum.V1)),
 });
 
 export type BroadcastResource = Static<typeof BroadcastResource>;
@@ -1214,6 +1428,9 @@ export type TriggerBroadcastRequest = Static<typeof TriggerBroadcastRequest>;
 export const UpsertSegmentResource = Type.Intersect([
   Type.Omit(Type.Partial(SegmentResource), ["workspaceId", "name"]),
   Type.Pick(SegmentResource, ["workspaceId", "name"]),
+  Type.Object({
+    createOnly: Type.Optional(Type.Boolean()),
+  }),
 ]);
 
 export type UpsertSegmentResource = Static<typeof UpsertSegmentResource>;
@@ -1260,6 +1477,16 @@ export const DeleteSegmentRequest = Type.Object({
 
 export type DeleteSegmentRequest = Static<typeof DeleteSegmentRequest>;
 
+export const UpdateSegmentStatusRequest = Type.Object({
+  workspaceId: Type.String(),
+  id: Type.String(),
+  status: SegmentStatus,
+});
+
+export type UpdateSegmentStatusRequest = Static<
+  typeof UpdateSegmentStatusRequest
+>;
+
 export const UserId = Type.String({
   description:
     "Unique identifier for the user. Should be the id of the user in your system. Only applicable to logged in users.",
@@ -1294,8 +1521,17 @@ export const GetEventsRequest = Type.Object({
   userId: Type.Optional(UserId),
   offset: Type.Optional(Type.Number()),
   limit: Type.Optional(Type.Number()),
+  messageId: Type.Optional(
+    Type.Union([Type.String(), Type.Array(Type.String())]),
+  ),
+  // unix timestamp units ms
   startDate: Type.Optional(Type.Number()),
   endDate: Type.Optional(Type.Number()),
+  event: Type.Optional(Type.Array(Type.String())),
+  broadcastId: Type.Optional(Type.String()),
+  journeyId: Type.Optional(Type.String()),
+  eventType: Type.Optional(Type.String()),
+  includeContext: Type.Optional(Type.Boolean()),
 });
 
 export type GetEventsRequest = Static<typeof GetEventsRequest>;
@@ -1331,6 +1567,7 @@ export const GetEventsResponseItem = Type.Object({
   processingTime: Type.String(),
   eventTime: Type.String(),
   traits: Type.String(),
+  context: Type.Optional(Type.String()),
 });
 
 export type GetEventsResponseItem = Static<typeof GetEventsResponseItem>;
@@ -1341,6 +1578,12 @@ export const GetEventsResponse = Type.Object({
 });
 
 export type GetEventsResponse = Static<typeof GetEventsResponse>;
+
+export const DownloadEventsRequest = Type.Omit(GetEventsRequest, [
+  "offset",
+  "limit",
+]);
+export type DownloadEventsRequest = Static<typeof DownloadEventsRequest>;
 
 export const LowCodeEmailJsonBody = Type.Recursive(
   (self) =>
@@ -1372,12 +1615,14 @@ export const LowCodeEmailJsonBody = Type.Recursive(
 
 export type LowCodeEmailJsonBody = Static<typeof LowCodeEmailJsonBody>;
 
-export enum EmailContentsType {
-  Code = "Code",
-  LowCode = "LowCode",
-}
+export const EmailContentsType = {
+  Code: "Code",
+  LowCode: "LowCode",
+} as const;
 
-export const EmailContentsTypeEnum = Type.Enum(EmailContentsType);
+export const EmailContentsTypeEnum = Type.KeyOf(Type.Const(EmailContentsType));
+
+export type EmailContentsType = Static<typeof EmailContentsTypeEnum>;
 
 export const BaseEmailContents = Type.Object({
   from: Type.String(),
@@ -1407,6 +1652,7 @@ export type BaseEmailContents = Static<typeof BaseEmailContents>;
 export const CodeEmailContents = Type.Composite([
   BaseEmailContents,
   Type.Object({
+    emailContentsType: Type.Optional(Type.Literal(EmailContentsType.Code)),
     body: Type.String(),
   }),
 ]);
@@ -1612,6 +1858,7 @@ export const UpsertMessageTemplateResource = Type.Object({
   name: Type.String(),
   definition: Type.Optional(MessageTemplateResourceDefinition),
   draft: Type.Optional(Nullable(MessageTemplateResourceDraft)),
+  resourceType: Type.Optional(ResourceType),
 });
 
 export type UpsertMessageTemplateResource = Static<
@@ -1651,6 +1898,8 @@ export type UpsertMessageTemplateValidationError = Static<
 export const GetMessageTemplatesRequest = Type.Object(
   {
     workspaceId: Type.String(),
+    ids: Type.Optional(Type.Array(Type.String())),
+    resourceType: Type.Optional(ResourceType),
   },
   {
     $id: "GetMessageTemplatesRequest",
@@ -1661,14 +1910,9 @@ export type GetMessageTemplatesRequest = Static<
   typeof GetMessageTemplatesRequest
 >;
 
-export const GetMessageTemplatesResponse = Type.Object(
-  {
-    templates: Type.Array(MessageTemplateResource),
-  },
-  {
-    $id: "GetMessageTemplatesResponse",
-  },
-);
+export const GetMessageTemplatesResponse = Type.Object({
+  templates: Type.Array(MessageTemplateResource),
+});
 
 export type GetMessageTemplatesResponse = Static<
   typeof GetMessageTemplatesResponse
@@ -1676,12 +1920,14 @@ export type GetMessageTemplatesResponse = Static<
 
 export const GetSegmentsRequest = Type.Object({
   workspaceId: Type.String(),
+  ids: Type.Optional(Type.Array(Type.String())),
+  resourceType: Type.Optional(ResourceType),
 });
 
 export type GetSegmentsRequest = Static<typeof GetSegmentsRequest>;
 
 export const GetSegmentsResponse = Type.Object({
-  segments: Type.Array(SegmentResource),
+  segments: Type.Array(SavedSegmentResource),
 });
 
 export type GetSegmentsResponse = Static<typeof GetSegmentsResponse>;
@@ -1749,78 +1995,16 @@ export type RequestStatus<V, E> =
   | SuccessfulRequest<V>
   | FailedRequest<E>;
 
-export const TestEmailProvider = Type.Object({
+export const PersistedEmailProvider = Type.Object({
   id: Type.String(),
   workspaceId: Type.String(),
-  type: Type.Literal(EmailProviderType.Test),
+  type: WorkspaceWideEmailProviders,
 });
-
-export type TestEmailProvider = Static<typeof TestEmailProvider>;
-
-export const SendgridEmailProvider = Type.Object({
-  id: Type.String(),
-  workspaceId: Type.String(),
-  type: Type.Literal(EmailProviderType.Sendgrid),
-});
-
-export type SendgridEmailProvider = Static<typeof SendgridEmailProvider>;
-
-export const AmazonSesEmailProvider = Type.Object({
-  id: Type.String(),
-  workspaceId: Type.String(),
-  type: Type.Literal(EmailProviderType.AmazonSes),
-});
-
-export type AmazonSesEmailProvider = Static<typeof AmazonSesEmailProvider>;
-
-export const SmtpEmailProvider = Type.Object({
-  id: Type.String(),
-  workspaceId: Type.String(),
-  type: Type.Literal(EmailProviderType.Smtp),
-});
-
-export type SmtpEmailProvider = Static<typeof SmtpEmailProvider>;
-
-export const ResendEmailProvider = Type.Object({
-  id: Type.String(),
-  workspaceId: Type.String(),
-  type: Type.Literal(EmailProviderType.Resend),
-});
-
-export type ResendEmailProvider = Static<typeof ResendEmailProvider>;
-
-export const PostMarkEmailProvider = Type.Object({
-  id: Type.String(),
-  workspaceId: Type.String(),
-  type: Type.Literal(EmailProviderType.PostMark),
-});
-
-export type PostMarkEmailProvider = Static<typeof PostMarkEmailProvider>;
-
-export const MailChimpEmailProvider = Type.Object({
-  id: Type.String(),
-  workspaceId: Type.String(),
-  type: Type.Literal(EmailProviderType.MailChimp),
-});
-
-export type MailChimpEmailProvider = Static<typeof MailChimpEmailProvider>;
-
-export const PersistedEmailProvider = Type.Union([
-  MailChimpEmailProvider,
-  SendgridEmailProvider,
-  AmazonSesEmailProvider,
-  PostMarkEmailProvider,
-  ResendEmailProvider,
-  SmtpEmailProvider,
-  TestEmailProvider,
-]);
 
 export type PersistedEmailProvider = Static<typeof PersistedEmailProvider>;
 
-export const EmailProviderResource = Type.Union([
-  PersistedEmailProvider,
-  TestEmailProvider,
-]);
+// Backwards compatibility with old email provider types.
+export const EmailProviderResource = PersistedEmailProvider;
 
 export type EmailProviderResource = Static<typeof EmailProviderResource>;
 
@@ -1954,7 +2138,7 @@ export type ExitUiNodeProps = Static<typeof ExitUiNodeProps>;
 
 export const EmailMessageUiNodeProps = Type.Object({
   channel: Type.Literal(ChannelType.Email),
-  providerOverride: Type.Optional(Type.Enum(EmailProviderType)),
+  providerOverride: Type.Optional(WorkspaceWideEmailProviders),
 });
 
 export type EmailMessageUiNodeProps = Static<typeof EmailMessageUiNodeProps>;
@@ -2002,6 +2186,7 @@ export const BaseMessageUiNodeProps = Type.Object({
   templateId: Type.Optional(Type.String()),
   subscriptionGroupId: Type.Optional(Type.String()),
   syncProperties: Type.Optional(Type.Boolean()),
+  skipOnFailure: Type.Optional(Type.Boolean()),
 });
 
 export type BaseMessageUiNodeProps = Static<typeof BaseMessageUiNodeProps>;
@@ -2054,11 +2239,26 @@ export const WaitForUiNodeProps = Type.Object({
 
 export type WaitForUiNodeProps = Static<typeof WaitForUiNodeProps>;
 
+export const RandomCohortUiChild = Type.Object({
+  name: Type.String(),
+  percent: Type.Number(),
+});
+
+export type RandomCohortUiChild = Static<typeof RandomCohortUiChild>;
+
+export const RandomCohortUiNodeProps = Type.Object({
+  type: Type.Literal(JourneyNodeType.RandomCohortNode),
+  cohortChildren: Type.Array(RandomCohortUiChild),
+});
+
+export type RandomCohortUiNodeProps = Static<typeof RandomCohortUiNodeProps>;
+
 export const JourneyUiBodyNodeTypeProps = Type.Union([
   MessageUiNodeProps,
   DelayUiNodeProps,
   SegmentSplitUiNodeProps,
   WaitForUiNodeProps,
+  RandomCohortUiNodeProps,
 ]);
 
 export type JourneyUiBodyNodeTypeProps = Static<
@@ -2265,6 +2465,11 @@ export const SavedJourneyResource = Type.Union([
 export type SavedJourneyResource = Static<typeof SavedJourneyResource>;
 
 export const UpsertJourneyResource = Type.Composite([
+  IdOrName,
+  Type.Object({
+    workspaceId: Type.String(),
+    draft: Type.Optional(Nullable(JourneyDraft)),
+  }),
   Type.Partial(
     Type.Omit(
       Type.Object({
@@ -2275,23 +2480,28 @@ export const UpsertJourneyResource = Type.Composite([
       ["draft"],
     ),
   ),
-  Type.Object({
-    name: Type.String(),
-    workspaceId: Type.String(),
-    draft: Type.Optional(Nullable(JourneyDraft)),
-  }),
 ]);
 
 export type UpsertJourneyResource = Static<typeof UpsertJourneyResource>;
 
 export const GetJourneysRequest = Type.Object({
   workspaceId: Type.String(),
+  getPartial: Type.Optional(Type.Boolean()),
+  ids: Type.Optional(Type.Array(Type.String())),
+  resourceType: Type.Optional(Type.Enum(ResourceTypeEnum)),
 });
 
 export type GetJourneysRequest = Static<typeof GetJourneysRequest>;
 
+export const GetJourneysResponseItem = Type.Composite([
+  Type.Omit(SavedJourneyResource, ["definition", "draft"]),
+  Type.Partial(Type.Pick(SavedJourneyResource, ["definition", "draft"])),
+]);
+
+export type GetJourneysResponseItem = Static<typeof GetJourneysResponseItem>;
+
 export const GetJourneysResponse = Type.Object({
-  journeys: Type.Array(SavedJourneyResource),
+  journeys: Type.Array(GetJourneysResponseItem),
 });
 
 export type GetJourneysResponse = Static<typeof GetJourneysResponse>;
@@ -2309,6 +2519,18 @@ export const DeleteJourneyRequest = Type.Object({
 
 export type DeleteJourneyRequest = Static<typeof DeleteJourneyRequest>;
 
+export const UserPropertyStatusEnum = {
+  NotStarted: "NotStarted",
+  Running: "Running",
+  Paused: "Paused",
+} as const;
+
+export const UserPropertyStatus = Type.KeyOf(
+  Type.Const(UserPropertyStatusEnum),
+);
+
+export type UserPropertyStatus = Static<typeof UserPropertyStatus>;
+
 export const UserPropertyResource = Type.Object({
   id: Type.String(),
   workspaceId: Type.String(),
@@ -2317,6 +2539,7 @@ export const UserPropertyResource = Type.Object({
   exampleValue: Type.Optional(Type.String()),
   updatedAt: Type.Number(),
   lastRecomputed: Type.Optional(Type.Number()),
+  status: Type.Optional(UserPropertyStatus),
 });
 
 export type UserPropertyResource = Static<typeof UserPropertyResource>;
@@ -2352,6 +2575,105 @@ export type DeleteUserPropertyRequest = Static<
   typeof DeleteUserPropertyRequest
 >;
 
+// User Property Index types
+export const UserPropertyIndexType = Type.Union([
+  Type.Literal("String"),
+  Type.Literal("Number"),
+  Type.Literal("Date"),
+]);
+
+export type UserPropertyIndexType = Static<typeof UserPropertyIndexType>;
+
+export const UserPropertyIndexResource = Type.Object({
+  id: Type.String(),
+  workspaceId: Type.String(),
+  userPropertyId: Type.String(),
+  type: UserPropertyIndexType,
+  createdAt: Type.Number(),
+  updatedAt: Type.Number(),
+});
+
+export type UserPropertyIndexResource = Static<
+  typeof UserPropertyIndexResource
+>;
+
+export const GetUserPropertyIndicesRequest = Type.Object({
+  workspaceId: Type.String(),
+});
+
+export type GetUserPropertyIndicesRequest = Static<
+  typeof GetUserPropertyIndicesRequest
+>;
+
+export const GetUserPropertyIndicesResponse = Type.Object({
+  indices: Type.Array(UserPropertyIndexResource),
+});
+
+export type GetUserPropertyIndicesResponse = Static<
+  typeof GetUserPropertyIndicesResponse
+>;
+
+export const UpsertUserPropertyIndexRequest = Type.Object({
+  workspaceId: Type.String(),
+  userPropertyId: Type.String(),
+  type: UserPropertyIndexType,
+});
+
+export type UpsertUserPropertyIndexRequest = Static<
+  typeof UpsertUserPropertyIndexRequest
+>;
+
+export const DeleteUserPropertyIndexRequest = Type.Object({
+  workspaceId: Type.String(),
+  userPropertyId: Type.String(),
+});
+
+export type DeleteUserPropertyIndexRequest = Static<
+  typeof DeleteUserPropertyIndexRequest
+>;
+
+export const UpdateUserPropertyStatusRequest = Type.Object({
+  workspaceId: Type.String(),
+  id: Type.String(),
+  status: UserPropertyStatus,
+});
+
+export type UpdateUserPropertyStatusRequest = Static<
+  typeof UpdateUserPropertyStatusRequest
+>;
+
+export enum UpdateUserPropertyStatusErrorType {
+  ProtectedUserProperty = "ProtectedUserProperty",
+  NotFound = "NotFound",
+}
+
+export const UpdateUserPropertyStatusProtectedError = Type.Object({
+  type: Type.Literal(UpdateUserPropertyStatusErrorType.ProtectedUserProperty),
+  message: Type.String(),
+});
+
+export type UpdateUserPropertyStatusProtectedError = Static<
+  typeof UpdateUserPropertyStatusProtectedError
+>;
+
+export const UpdateUserPropertyStatusNotFoundError = Type.Object({
+  type: Type.Literal(UpdateUserPropertyStatusErrorType.NotFound),
+  message: Type.String(),
+});
+
+export type UpdateUserPropertyStatusNotFoundError = Static<
+  typeof UpdateUserPropertyStatusNotFoundError
+>;
+
+export const UpdateUserPropertyStatusError = Type.Union([
+  UpdateUserPropertyStatusProtectedError,
+  UpdateUserPropertyStatusNotFoundError,
+]);
+
+export type UpdateUserPropertyStatusError = Static<
+  typeof UpdateUserPropertyStatusError
+>;
+
 export const ReadAllUserPropertiesRequest = Type.Object({
   workspaceId: Type.String(),
 });
@@ -2381,6 +2703,15 @@ export type GetUsersUserPropertyFilter = Static<
   typeof GetUsersUserPropertyFilter
 >;
 
+export enum SortOrderEnum {
+  Asc = "asc",
+  Desc = "desc",
+}
+
+export const SortOrder = Type.Enum(SortOrderEnum);
+
+export type SortOrder = Static<typeof SortOrder>;
+
 export const GetUsersRequest = Type.Object({
   cursor: Type.Optional(Type.String()),
   segmentFilter: Type.Optional(Type.Array(Type.String())),
@@ -2390,9 +2721,26 @@ export const GetUsersRequest = Type.Object({
   subscriptionGroupFilter: Type.Optional(Type.Array(Type.String())),
   userPropertyFilter: Type.Optional(GetUsersUserPropertyFilter),
   workspaceId: Type.String(),
+  includeSubscriptions: Type.Optional(Type.Boolean()),
+  sortBy: Type.Optional(Type.String()),
+  sortOrder: Type.Optional(SortOrder),
+  /**
+   * When true, cursor comparison is exclusive (< or >) for both directions.
+   * When false (default), Before direction uses inclusive comparison (<= or >=).
+   * Set to true for correct back-navigation behavior.
+   */
+  exclusiveCursor: Type.Optional(Type.Boolean()),
 });
 
 export type GetUsersRequest = Static<typeof GetUsersRequest>;
+
+export const UserSubscriptionItem = Type.Object({
+  id: Type.String(),
+  name: Type.String(),
+  subscribed: Type.Boolean(),
+});
+
+export type UserSubscriptionItem = Static<typeof UserSubscriptionItem>;
 
 const GetUsersResponseItem = Type.Object({
   id: Type.String(),
@@ -2410,6 +2758,7 @@ const GetUsersResponseItem = Type.Object({
       name: Type.String(),
     }),
   ),
+  subscriptions: Type.Optional(Type.Array(UserSubscriptionItem)),
 });
 
 export type GetUsersResponseItem = Static<typeof GetUsersResponseItem>;
@@ -2440,6 +2789,8 @@ export type GetUsersCountRequest = Static<typeof GetUsersCountRequest>;
 export const BaseMessageResponse = Type.Object({
   message: Type.String(),
 });
+
+export type BaseMessageResponse = Static<typeof BaseMessageResponse>;
 
 export const BadRequestResponse = BaseMessageResponse;
 
@@ -2511,8 +2862,63 @@ export type WorkspaceMemberRoleResource = Static<
   typeof WorkspaceMemberRoleResource
 >;
 
+export const CreateWorkspaceMemberRoleRequest = Type.Object({
+  workspaceId: Type.String(),
+  email: Type.String(),
+  role: Role,
+});
+
+export type CreateWorkspaceMemberRoleRequest = Static<
+  typeof CreateWorkspaceMemberRoleRequest
+>;
+
+export const UpdateWorkspaceMemberRoleRequest = Type.Object({
+  workspaceId: Type.String(),
+  email: Type.String(),
+  role: Role,
+});
+
+export type UpdateWorkspaceMemberRoleRequest = Static<
+  typeof UpdateWorkspaceMemberRoleRequest
+>;
+
+export const DeleteWorkspaceMemberRoleRequest = Type.Object({
+  workspaceId: Type.String(),
+  email: Type.String(),
+});
+
+export type DeleteWorkspaceMemberRoleRequest = Static<
+  typeof DeleteWorkspaceMemberRoleRequest
+>;
+
+export const GetWorkspaceMemberRolesRequest = Type.Object({
+  workspaceId: Type.String(),
+});
+
+export type GetWorkspaceMemberRolesRequest = Static<
+  typeof GetWorkspaceMemberRolesRequest
+>;
+
+export const WorkspaceMemberWithRoles = Type.Object({
+  member: WorkspaceMemberResource,
+  roles: Type.Array(WorkspaceMemberRoleResource),
+});
+
+export type WorkspaceMemberWithRoles = Static<typeof WorkspaceMemberWithRoles>;
+
+export const GetWorkspaceMemberRolesResponse = Type.Object({
+  memberRoles: Type.Array(WorkspaceMemberWithRoles),
+});
+
+export type GetWorkspaceMemberRolesResponse = Static<
+  typeof GetWorkspaceMemberRolesResponse
+>;
+
 export interface DFRequestContext {
-  workspace: WorkspaceResource;
+  workspace: WorkspaceResource & {
+    type: WorkspaceTypeApp;
+    parentWorkspaceId?: string;
+  };
   member: WorkspaceMemberResource;
   memberRoles: WorkspaceMemberRoleResource[];
 }
@@ -2521,6 +2927,7 @@ export const UserSubscriptionResource = Type.Object({
   id: Type.String(),
   name: Type.String(),
   isSubscribed: Type.Boolean(),
+  channel: Type.Enum(ChannelType),
 });
 
 export type UserSubscriptionResource = Static<typeof UserSubscriptionResource>;
@@ -2552,6 +2959,17 @@ export const SubscriptionParams = Type.Object(
           description: "Unsubscribing user from subscription group.",
         }),
       ]),
+    ),
+    isPreview: Type.Optional(
+      Type.String({
+        description: "Preview mode flag to skip subscription updates.",
+      }),
+    ),
+    showAllChannels: Type.Optional(
+      Type.String({
+        description:
+          "Show subscription groups for all channels instead of just the changed channel.",
+      }),
     ),
   },
   {
@@ -2689,6 +3107,7 @@ export type RenderMessageTemplateResponse = Static<
 >;
 
 export const DeleteSubscriptionGroupRequest = Type.Object({
+  workspaceId: Type.String(),
   id: Type.String(),
 });
 
@@ -2729,6 +3148,13 @@ export const BlobStorageFile = Type.Object(
 );
 
 export type BlobStorageFile = Static<typeof BlobStorageFile>;
+
+export const AppDataFileInternal = Type.Union([
+  Base64EncodedFile,
+  BlobStorageFile,
+]);
+
+export type AppDataFileInternal = Static<typeof AppDataFileInternal>;
 
 export const AppDataFile = Type.Union([Base64EncodedFile], {
   description: "File associated with user event.",
@@ -2777,6 +3203,7 @@ export const BaseBatchIdentifyData = {
   ...BaseAppData,
   type: Type.Literal(EventType.Identify),
   traits: Type.Optional(Traits),
+  context: AppDataContext,
 };
 
 const KnownIdentifyData = Type.Object({
@@ -2855,6 +3282,7 @@ export const BaseBatchTrackData = {
   files: AppDataFiles,
   event: TrackEventName,
   properties: Type.Optional(TrackEventProperties),
+  context: AppDataContext,
   type: Type.Literal(EventType.Track),
 };
 
@@ -2918,6 +3346,7 @@ export const BaseBatchGroupData = {
   groupId: Type.String(),
   assigned: Type.Optional(Type.Boolean()),
   traits: Type.Optional(GroupEventTraits),
+  context: AppDataContext,
   type: Type.Literal(EventType.Group),
 };
 
@@ -2991,6 +3420,7 @@ export const BaseBatchPageData = {
   ...BaseAppData,
   name: Type.Optional(PageName),
   properties: Type.Optional(PageProperties),
+  context: AppDataContext,
   type: Type.Literal(EventType.Page),
 };
 
@@ -3054,6 +3484,7 @@ export const BaseBatchScreenData = {
   ...BaseAppData,
   name: Type.Optional(ScreenName),
   properties: Type.Optional(ScreenProperties),
+  context: AppDataContext,
   type: Type.Literal(EventType.Screen),
 };
 
@@ -3387,9 +3818,21 @@ export const TwilioSecret = Type.Object({
   accountSid: Type.Optional(Type.String()),
   messagingServiceSid: Type.Optional(Type.String()),
   authToken: Type.Optional(Type.String()),
+  apiKeySid: Type.Optional(Type.String()),
+  apiKeySecret: Type.Optional(Type.String()),
 });
 
 export type TwilioSecret = Static<typeof TwilioSecret>;
+
+export const SignalWireSecret = Type.Object({
+  type: Type.Literal(SmsProviderType.SignalWire),
+  project: Type.Optional(Type.String()),
+  token: Type.Optional(Type.String()),
+  spaceUrl: Type.Optional(Type.String()),
+  phone: Type.Optional(Type.String()),
+});
+
+export type SignalWireSecret = Static<typeof SignalWireSecret>;
 
 export const TestSmsSecret = Type.Object({
   type: Type.Literal(SmsProviderType.Test),
@@ -3405,7 +3848,11 @@ export const TestSmsProvider = Type.Object({
 
 export type TestSmsProvider = Static<typeof TestSmsProvider>;
 
-export const SmsProviderSecret = Type.Union([TwilioSecret, TestSmsSecret]);
+export const SmsProviderSecret = Type.Union([
+  TwilioSecret,
+  TestSmsSecret,
+  SignalWireSecret,
+]);
 
 export type SmsProviderSecret = Static<typeof SmsProviderSecret>;
 
@@ -3417,8 +3864,17 @@ export const TwilioSmsProvider = Type.Object({
 
 export type TwilioSmsProvider = Static<typeof TwilioSmsProvider>;
 
+export const SignalWireSmsProvider = Type.Object({
+  id: Type.String(),
+  workspaceId: Type.String(),
+  type: Type.Optional(Type.Literal(SmsProviderType.SignalWire)),
+});
+
+export type SignalWireSmsProvider = Static<typeof SignalWireSmsProvider>;
+
 export const PersistedSmsProvider = Type.Union([
   TwilioSmsProvider,
+  SignalWireSmsProvider,
   TestSmsProvider,
 ]);
 
@@ -3442,6 +3898,14 @@ export const SmsTwilioSuccess = Type.Object({
 
 export type SmsTwilioSuccess = Static<typeof SmsTwilioSuccess>;
 
+export const SmsSignalWireSuccess = Type.Object({
+  type: Type.Literal(SmsProviderType.SignalWire),
+  status: Type.String(),
+  sid: Type.String(),
+});
+
+export type SmsSignalWireSuccess = Static<typeof SmsSignalWireSuccess>;
+
 export const SmsTestSuccess = Type.Object({
   type: Type.Literal(SmsProviderType.Test),
 });
@@ -3450,6 +3914,7 @@ export type SmsTestSuccess = Static<typeof SmsTestSuccess>;
 
 export const SmsServiceProviderSuccess = Type.Union([
   SmsTwilioSuccess,
+  SmsSignalWireSuccess,
   SmsTestSuccess,
 ]);
 
@@ -3475,7 +3940,7 @@ export const EmailTestSuccess = Type.Object({
 export type EmailTestSuccess = Static<typeof EmailTestSuccess>;
 
 export const EmailSendgridSuccess = Type.Object({
-  type: Type.Literal(EmailProviderType.Sendgrid),
+  type: Type.Literal(EmailProviderType.SendGrid),
 });
 
 export type EmailSendgridSuccess = Static<typeof EmailSendgridSuccess>;
@@ -3486,6 +3951,14 @@ export const EmailAmazonSesSuccess = Type.Object({
 });
 
 export type EmailAmazonSesSuccess = Static<typeof EmailAmazonSesSuccess>;
+
+export const EmailGmailSuccess = Type.Object({
+  type: Type.Literal(EmailProviderType.Gmail),
+  messageId: Type.String(),
+  threadId: Type.String(),
+});
+
+export type EmailGmailSuccess = Static<typeof EmailGmailSuccess>;
 
 export const EmailSmtpSuccess = Type.Object({
   type: Type.Literal(EmailProviderType.Smtp),
@@ -3518,6 +3991,7 @@ export const EmailServiceProviderSuccess = Type.Union([
   EmailAmazonSesSuccess,
   EmailPostMarkSuccess,
   EmailResendSuccess,
+  EmailGmailSuccess,
   EmailSmtpSuccess,
   EmailTestSuccess,
 ]);
@@ -3548,8 +4022,19 @@ export type MessageEmailSuccess = Static<typeof MessageEmailSuccess>;
 
 export const WebhookResponse = Type.Object({
   status: Type.Optional(Type.Number()),
-  headers: Type.Optional(Type.Record(Type.String(), Type.String())),
-  body: Type.Unknown(),
+  headers: Type.Optional(
+    Type.Record(
+      Type.String(),
+      Type.Union([
+        Type.String(),
+        Type.Number(),
+        Type.Array(Type.String()),
+        Type.Null(),
+        Type.Boolean(),
+      ]),
+    ),
+  ),
+  body: Type.Optional(Type.Unknown()),
 });
 
 export type WebhookResponse = Static<typeof WebhookResponse>;
@@ -3687,7 +4172,7 @@ export type MessageSendBadConfiguration = Static<
 >;
 
 export const MessageSendgridServiceFailure = Type.Object({
-  type: Type.Literal(EmailProviderType.Sendgrid),
+  type: Type.Literal(EmailProviderType.SendGrid),
   status: Type.Optional(Type.Number()),
   body: Type.Optional(Type.String()),
 });
@@ -3703,6 +4188,82 @@ export const MessageAmazonSesServiceFailure = Type.Object({
 
 export type MessageAmazonSesServiceFailure = Static<
   typeof MessageAmazonSesServiceFailure
+>;
+
+export const SendGmailFailureTypeEnum = {
+  NonRetryableGoogleError: "NonRetryableGoogleError",
+  ConfigurationError: "ConfigurationError",
+  ConstructionError: "ConstructionError",
+  UnknownError: "UnknownError",
+} as const;
+
+export const SendGmailFailureType = Type.KeyOf(
+  Type.Const(SendGmailFailureTypeEnum),
+);
+
+export type SendGmailFailureType = Static<typeof SendGmailFailureType>;
+
+// --- TypeBox Schemas for Failure Reasons ---
+// Individual error type schemas
+export const GmailSendConfigurationError = Type.Object({
+  type: Type.Literal(EmailProviderType.Gmail),
+  errorType: Type.Literal(SendGmailFailureTypeEnum.ConfigurationError),
+  message: Type.String(),
+  details: Type.Optional(Type.Unknown()),
+});
+
+export type GmailSendConfigurationError = Static<
+  typeof GmailSendConfigurationError
+>;
+
+export const GmailSendConstructionError = Type.Object({
+  type: Type.Literal(EmailProviderType.Gmail),
+  errorType: Type.Literal(SendGmailFailureTypeEnum.ConstructionError),
+  message: Type.String(),
+  details: Type.Optional(Type.Unknown()),
+});
+
+export type GmailSendConstructionError = Static<
+  typeof GmailSendConstructionError
+>;
+
+export const GmailSendNonRetryableError = Type.Object({
+  type: Type.Literal(EmailProviderType.Gmail),
+  errorType: Type.Literal(SendGmailFailureTypeEnum.NonRetryableGoogleError),
+  message: Type.String(),
+  statusCode: Type.Optional(
+    Type.Union([Type.String(), Type.Number(), Type.Null()]),
+  ),
+  googleErrorCode: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  googleErrorDescription: Type.Optional(
+    Type.Union([Type.String(), Type.Null()]),
+  ),
+  details: Type.Optional(Type.Unknown()),
+});
+
+export type GmailSendNonRetryableError = Static<
+  typeof GmailSendNonRetryableError
+>;
+
+export const GmailSendUnknownError = Type.Object({
+  type: Type.Literal(EmailProviderType.Gmail),
+  errorType: Type.Literal(SendGmailFailureTypeEnum.UnknownError),
+  message: Type.String(),
+  details: Type.Optional(Type.Unknown()),
+});
+
+export type GmailSendUnknownError = Static<typeof GmailSendUnknownError>;
+
+// Union of all failure reason schemas
+export const MessageGmailServiceFailure = Type.Union([
+  GmailSendNonRetryableError,
+  GmailSendConfigurationError,
+  GmailSendConstructionError,
+  GmailSendUnknownError,
+]);
+
+export type MessageGmailServiceFailure = Static<
+  typeof MessageGmailServiceFailure
 >;
 
 export const MessageSmtpFailure = Type.Object({
@@ -3743,6 +4304,7 @@ export const EmailServiceProviderFailure = Type.Union([
   MessageResendFailure,
   MessagePostMarkFailure,
   MessageSmtpFailure,
+  MessageGmailServiceFailure,
 ]);
 
 export type EmailServiceProviderFailure = Static<
@@ -3763,8 +4325,24 @@ export const MessageTwilioServiceFailure = Type.Object({
   message: Type.Optional(Type.String()),
 });
 
+export type MessageTwilioServiceFailure = Static<
+  typeof MessageTwilioServiceFailure
+>;
+
+export const MessageSignalWireServiceFailure = Type.Object({
+  type: Type.Literal(SmsProviderType.SignalWire),
+  errorCode: Type.String(),
+  errorMessage: Type.Optional(Type.String()),
+  status: Type.String(),
+});
+
+export type MessageSignalWireServiceFailure = Static<
+  typeof MessageSignalWireServiceFailure
+>;
+
 export const SmsServiceProviderFailure = Type.Union([
   MessageTwilioServiceFailure,
+  MessageSignalWireServiceFailure,
 ]);
 
 export type SmsServiceProviderFailure = Static<
@@ -3848,6 +4426,15 @@ export const MessageSkippedFailure = Type.Object({
 
 export type MessageSkippedFailure = Static<typeof MessageSkippedFailure>;
 
+export const NonRetryableMessageSendFailure = Type.Union([
+  MessageSendBadConfiguration,
+  MessageServiceFailure,
+]);
+
+export type NonRetryableMessageSendFailure = Static<
+  typeof NonRetryableMessageSendFailure
+>;
+
 export const MessageSendFailure = Type.Union([
   MessageSendBadConfiguration,
   MessageServiceFailure,
@@ -3872,26 +4459,51 @@ const BaseMessageTemplateTestRequest = {
   tags: Type.Optional(Type.Record(Type.String(), Type.String())),
 } as const;
 
+export const EmailMessageTemplateTestRequest = Type.Object({
+  ...BaseMessageTemplateTestRequest,
+  channel: Type.Literal(ChannelType.Email),
+  provider: Type.Optional(Type.Enum(EmailProviderType)),
+});
+
+export type EmailMessageTemplateTestRequest = Static<
+  typeof EmailMessageTemplateTestRequest
+>;
+
+export const SmsMessageTemplateTestRequest = Type.Object({
+  ...BaseMessageTemplateTestRequest,
+  channel: Type.Literal(ChannelType.Sms),
+  provider: Type.Optional(Type.Enum(SmsProviderType)),
+});
+
+export type SmsMessageTemplateTestRequest = Static<
+  typeof SmsMessageTemplateTestRequest
+>;
+
+export const MobilePushMessageTemplateTestRequest = Type.Object({
+  ...BaseMessageTemplateTestRequest,
+  channel: Type.Literal(ChannelType.MobilePush),
+  provider: Type.Optional(Type.Enum(MobilePushProviderType)),
+});
+
+export type MobilePushMessageTemplateTestRequest = Static<
+  typeof MobilePushMessageTemplateTestRequest
+>;
+
+export const WebhookMessageTemplateTestRequest = Type.Object({
+  ...BaseMessageTemplateTestRequest,
+  channel: Type.Literal(ChannelType.Webhook),
+  provider: Type.Optional(Type.Null()),
+});
+
+export type WebhookMessageTemplateTestRequest = Static<
+  typeof WebhookMessageTemplateTestRequest
+>;
+
 export const MessageTemplateTestRequest = Type.Union([
-  Type.Object({
-    ...BaseMessageTemplateTestRequest,
-    channel: Type.Literal(ChannelType.Email),
-    provider: Type.Optional(Type.Enum(EmailProviderType)),
-  }),
-  Type.Object({
-    ...BaseMessageTemplateTestRequest,
-    channel: Type.Literal(ChannelType.Sms),
-    provider: Type.Optional(Type.Enum(SmsProviderType)),
-  }),
-  Type.Object({
-    ...BaseMessageTemplateTestRequest,
-    channel: Type.Literal(ChannelType.MobilePush),
-    provider: Type.Optional(Type.Enum(MobilePushProviderType)),
-  }),
-  Type.Object({
-    ...BaseMessageTemplateTestRequest,
-    channel: Type.Literal(ChannelType.Webhook),
-  }),
+  EmailMessageTemplateTestRequest,
+  SmsMessageTemplateTestRequest,
+  MobilePushMessageTemplateTestRequest,
+  WebhookMessageTemplateTestRequest,
 ]);
 
 export type MessageTemplateTestRequest = Static<
@@ -3922,50 +4534,13 @@ export const GetPropertiesResponse = Type.Object({
 
 export type GetPropertiesResponse = Static<typeof GetPropertiesResponse>;
 
-export const SearchDeliveriesRequestSortByEnum = {
-  from: "from",
-  to: "to",
-  status: "status",
-  sentAt: "sentAt",
-} as const;
-
-export const SearchDeliveriesRequestSortBy = Type.KeyOf(
-  Type.Const(SearchDeliveriesRequestSortByEnum),
-);
-
-export type SearchDeliveriesRequestSortBy = Static<
-  typeof SearchDeliveriesRequestSortBy
->;
-
-export const SearchDeliveriesRequest = Type.Object({
-  workspaceId: Type.String(),
-  fromIdentifier: Type.Optional(Type.String()),
-  toIdentifier: Type.Optional(Type.String()),
-  journeyId: Type.Optional(Type.String()),
-  userId: Type.Optional(Type.Union([UserId, Type.Array(UserId)])),
-  channels: Type.Optional(Type.Array(Type.Enum(ChannelType))),
-  limit: Type.Optional(Type.Number()),
-  cursor: Type.Optional(Type.String()),
-  from: Type.Optional(Type.Array(Type.String())),
-  to: Type.Optional(Type.Array(Type.String())),
-  statuses: Type.Optional(Type.Array(Type.String())),
-  templateIds: Type.Optional(Type.Array(Type.String())),
-  startDate: Type.Optional(Type.String()),
-  endDate: Type.Optional(Type.String()),
-  sortBy: Type.Optional(SearchDeliveriesRequestSortBy),
-  sortDirection: Type.Optional(SortDirection),
-  groupId: Type.Optional(
-    Type.Union([Type.String(), Type.Array(Type.String())]),
-  ),
-});
-
-export type SearchDeliveriesRequest = Static<typeof SearchDeliveriesRequest>;
-
 const BaseDeliveryItem = Type.Object({
   sentAt: Type.String(),
   updatedAt: Type.String(),
-  journeyId: Type.String(),
+  journeyId: Type.Optional(Type.String()),
+  broadcastId: Type.Optional(Type.String()),
   userId: UserId,
+  isAnonymous: Type.Optional(Type.Boolean()),
   originMessageId: Type.String(),
   triggeringMessageId: Type.Optional(Type.String()),
   templateId: Type.String(),
@@ -4019,8 +4594,74 @@ export const SearchDeliveriesResponse = Type.Object({
 
 export type SearchDeliveriesResponse = Static<typeof SearchDeliveriesResponse>;
 
+export const WorkspaceMemberSettingTypeEnum = {
+  GmailTokens: "GmailTokens",
+} as const;
+
+export const WorkspaceMemberSettingType = Type.KeyOf(
+  Type.Const(WorkspaceMemberSettingTypeEnum),
+);
+
+export type WorkspaceMemberSettingType = Static<
+  typeof WorkspaceMemberSettingType
+>;
+
+export const GmailTokensWorkspaceMemberSetting = Type.Object({
+  type: Type.Literal(WorkspaceMemberSettingTypeEnum.GmailTokens),
+  email: Type.String(),
+  accessToken: Type.Optional(Type.String()),
+  accessTokenIv: Type.Optional(Type.String()),
+  accessTokenAuthTag: Type.Optional(Type.String()),
+  refreshToken: Type.Optional(Type.String()),
+  refreshTokenIv: Type.Optional(Type.String()),
+  refreshTokenAuthTag: Type.Optional(Type.String()),
+  expiresAt: Type.Optional(Type.Number()),
+});
+
+export type GmailTokensWorkspaceMemberSetting = Static<
+  typeof GmailTokensWorkspaceMemberSetting
+>;
+
+export type WorkspaceMemberSettingSchema =
+  typeof GmailTokensWorkspaceMemberSetting;
+
+export const WorkspaceMemberSetting = Type.Union([
+  GmailTokensWorkspaceMemberSetting,
+]);
+
+export type WorkspaceMemberSetting = Static<typeof WorkspaceMemberSetting>;
+
+export const WorkspaceSettingSchemaRecord = {
+  [WorkspaceMemberSettingTypeEnum.GmailTokens]:
+    GmailTokensWorkspaceMemberSetting,
+} as const;
+
+export const WorkspaceSettingsResource = Type.Object({
+  workspaceId: Type.String(),
+  name: WorkspaceMemberSettingType,
+  config: WorkspaceMemberSetting,
+});
+
+export type WorkspaceSettingsResource = Static<
+  typeof WorkspaceSettingsResource
+>;
+
+export const GmailSecret = Type.Composite([
+  Type.Pick(GmailTokensWorkspaceMemberSetting, [
+    "email",
+    "accessToken",
+    "refreshToken",
+    "expiresAt",
+  ]),
+  Type.Object({
+    type: Type.Literal(EmailProviderType.Gmail),
+  }),
+]);
+
+export type GmailSecret = Static<typeof GmailSecret>;
+
 export const SendgridSecret = Type.Object({
-  type: Type.Literal(EmailProviderType.Sendgrid),
+  type: Type.Literal(EmailProviderType.SendGrid),
   apiKey: Type.Optional(Type.String()),
   webhookKey: Type.Optional(Type.String()),
 });
@@ -4116,9 +4757,15 @@ export const EmailProviderSecret = Type.Union([
   SmtpSecret,
   ResendSecret,
   TestEmailSecret,
+  GmailSecret,
 ]);
 
 export type EmailProviderSecret = Static<typeof EmailProviderSecret>;
+
+export const WorkspaceWideEmailProviderSecret = Type.Exclude(
+  EmailProviderSecret,
+  GmailSecret,
+);
 
 export const DeleteUsersRequest = Type.Object({
   workspaceId: Type.String(),
@@ -4201,6 +4848,7 @@ export type DeleteAdminApiKeyRequest = Static<typeof DeleteAdminApiKeyRequest>;
 
 export enum JourneyConstraintViolationType {
   WaitForNodeAndEventEntryNode = "WaitForNodeAndEventEntryNode",
+  KeyedPerformedSegmentEntryNode = "KeyedPerformedSegmentEntryNode",
   CantStart = "CantStart",
 }
 
@@ -4218,7 +4866,17 @@ export enum JourneyUpsertValidationErrorType {
   StatusTransitionError = "StatusTransitionError",
   IdError = "IdError",
   UniqueConstraintViolation = "UniqueConstraintViolation",
+  BadValues = "BadValues",
 }
+
+export const JourneyUpsertBadValuesError = Type.Object({
+  type: Type.Literal(JourneyUpsertValidationErrorType.BadValues),
+  message: Type.String(),
+});
+
+export type JourneyUpsertBadValuesError = Static<
+  typeof JourneyUpsertBadValuesError
+>;
 
 export const JourneyUpsertValidationConstraintViolationError = Type.Object({
   type: Type.Literal(JourneyUpsertValidationErrorType.ConstraintViolation),
@@ -4261,6 +4919,7 @@ export const JourneyUpsertValidationError = Type.Union([
   JourneyUpsertIdError,
   JourneyUpsertStatusTransitionError,
   JourneyUpsertUniqueConstraintViolationError,
+  JourneyUpsertBadValuesError,
 ]);
 
 export type JourneyUpsertValidationError = Static<
@@ -4344,15 +5003,11 @@ export const FeatureConfigByType = {
     DisplayJourneyPercentagesFeatureConfig,
 } as const;
 
-export enum ManualSegmentOperationEnum {
-  Add = "Add",
-  Remove = "Remove",
-}
-
 export const ManualSegmentUploadCsvHeaders = Type.Object({
   [WORKSPACE_ID_HEADER]: WorkspaceId,
   [SEGMENT_ID_HEADER]: Type.String(),
-  operation: Type.Enum(ManualSegmentOperationEnum),
+  // Optional header to control whether new values append or replace
+  [MANUAL_SEGMENT_APPEND_HEADER]: Type.Optional(Type.String()),
 });
 
 export type ManualSegmentUploadCsvHeaders = Static<
@@ -4512,7 +5167,7 @@ export type WorkspaceIdentifier = Static<typeof WorkspaceIdentifier>;
 export const UpsertEmailProviderRequest = Type.Object({
   workspaceId: Type.String(),
   setDefault: Type.Optional(Type.Boolean()),
-  config: EmailProviderSecret,
+  config: WorkspaceWideEmailProviderSecret,
 });
 
 export type UpsertEmailProviderRequest = Static<
@@ -4536,10 +5191,10 @@ export type TombstoneWorkspaceRequest = Static<
 export const BaseDeliveryBodyRequest = {
   workspaceId: Type.String(),
   userId: Type.String(),
-  journeyId: Type.Optional(Type.Null()),
-  templateId: Type.Optional(Type.Null()),
-  triggeringMessageId: Type.Optional(Type.Null()),
-  messageId: Type.Optional(Type.Null()),
+  journeyId: Type.Optional(Type.String()),
+  templateId: Type.Optional(Type.String()),
+  triggeringMessageId: Type.Optional(Type.String()),
+  messageId: Type.Optional(Type.String()),
 };
 
 export const JourneyTemplateDeliveryBodyRequest = Type.Object({
@@ -4555,7 +5210,6 @@ export type JourneyTemplateDeliveryBodyRequest = Static<
 export const TriggeringMessageDeliveryBodyRequest = Type.Object({
   ...BaseDeliveryBodyRequest,
   triggeringMessageId: Type.String(),
-  templateId: Type.Optional(Type.String()),
 });
 
 export type TriggeringMessageDeliveryBodyRequest = Static<
@@ -4633,14 +5287,48 @@ export const UpsertUserPropertyError = Type.Union([
 
 export type UpsertUserPropertyError = Static<typeof UpsertUserPropertyError>;
 
+export enum DuplicateResourceErrorType {
+  ResourceNotFound = "ResourceNotFound",
+  ProtectedResource = "ProtectedResource",
+}
+
+export const DuplicateResourceNotFoundError = Type.Object({
+  type: Type.Literal(DuplicateResourceErrorType.ResourceNotFound),
+  message: Type.String(),
+});
+
+export type DuplicateResourceNotFoundError = Static<
+  typeof DuplicateResourceNotFoundError
+>;
+
+export const DuplicateResourceProtectedError = Type.Object({
+  type: Type.Literal(DuplicateResourceErrorType.ProtectedResource),
+  message: Type.String(),
+});
+
+export type DuplicateResourceProtectedError = Static<
+  typeof DuplicateResourceProtectedError
+>;
+
+export const DuplicateResourceError = Type.Union([
+  DuplicateResourceNotFoundError,
+  DuplicateResourceProtectedError,
+]);
+
+export type DuplicateResourceError = Static<typeof DuplicateResourceError>;
+
 export const ComponentConfigurationEnum = {
   DeliveriesTable: "DeliveriesTable",
+  Broadcast: "Broadcast",
+  MessageTemplate: "MessageTemplate",
+  AnalysisChart: "AnalysisChart",
 } as const;
 
 export const DeliveriesAllowedColumnEnum = {
   preview: "preview",
   from: "from",
   to: "to",
+  userId: "userId",
   snippet: "snippet",
   channel: "channel",
   status: "status",
@@ -4648,11 +5336,26 @@ export const DeliveriesAllowedColumnEnum = {
   sentAt: "sentAt",
   template: "template",
   updatedAt: "updatedAt",
-};
+} as const;
 
 export const DeliveriesAllowedColumn = Type.KeyOf(
   Type.Const(DeliveriesAllowedColumnEnum),
 );
+
+export const SearchDeliveriesRequestSortByEnum = {
+  from: DeliveriesAllowedColumnEnum.from,
+  to: DeliveriesAllowedColumnEnum.to,
+  status: DeliveriesAllowedColumnEnum.status,
+  sentAt: DeliveriesAllowedColumnEnum.sentAt,
+} as const;
+
+export const SearchDeliveriesRequestSortBy = Type.KeyOf(
+  Type.Const(SearchDeliveriesRequestSortByEnum),
+);
+
+export type SearchDeliveriesRequestSortBy = Static<
+  typeof SearchDeliveriesRequestSortBy
+>;
 
 export type DeliveriesAllowedColumn = Static<typeof DeliveriesAllowedColumn>;
 
@@ -4668,8 +5371,128 @@ export type DeliveriesTableConfiguration = Static<
   typeof DeliveriesTableConfiguration
 >;
 
+export const BroadcastStepKeys = {
+  RECIPIENTS: "RECIPIENTS",
+  CONTENT: "CONTENT",
+  CONFIGURATION: "CONFIGURATION",
+  DELIVERIES: "DELIVERIES",
+  EVENTS: "EVENTS",
+} as const;
+
+export const BroadcastStepKey = Type.KeyOf(Type.Const(BroadcastStepKeys));
+
+export type BroadcastStepKey = Static<typeof BroadcastStepKey>;
+
+export const LowCodeEmailDefaultTypeEnum = {
+  Informative: "Informative",
+  Empty: "Empty",
+} as const;
+
+export const LowCodeEmailDefaultType = Type.KeyOf(
+  Type.Const(LowCodeEmailDefaultTypeEnum),
+);
+
+export type LowCodeEmailDefaultType = Static<typeof LowCodeEmailDefaultType>;
+
+export const BroadcastConfiguration = Type.Object({
+  type: Type.Literal(ComponentConfigurationEnum.Broadcast),
+  stepsAllowList: Type.Optional(Type.Array(BroadcastStepKey)),
+  emailProviderOverrideAllowList: Type.Optional(
+    Type.Array(EmailProviderTypeSchema),
+  ),
+  hideOverrideSelect: Type.Optional(Type.Boolean()),
+  hideScheduledSelect: Type.Optional(Type.Boolean()),
+  hideRateLimit: Type.Optional(Type.Boolean()),
+  hideDrawer: Type.Optional(Type.Boolean()),
+  hideTemplateUserPropertiesPanel: Type.Optional(Type.Boolean()),
+  showErrorHandling: Type.Optional(Type.Boolean()),
+  allowedEmailContentsTypes: Type.Optional(Type.Array(EmailContentsTypeEnum)),
+  lowCodeEmailDefaultType: Type.Optional(LowCodeEmailDefaultType),
+});
+
+export type BroadcastConfiguration = Static<typeof BroadcastConfiguration>;
+
+export const MessageTemplateConfiguration = Type.Object({
+  type: Type.Literal(ComponentConfigurationEnum.MessageTemplate),
+  allowedEmailContentsTypes: Type.Optional(Type.Array(EmailContentsTypeEnum)),
+  lowCodeEmailDefaultType: Type.Optional(LowCodeEmailDefaultType),
+});
+
+export type MessageTemplateConfiguration = Static<
+  typeof MessageTemplateConfiguration
+>;
+
+export const AnalysisFilterKeyEnum = {
+  journeyIds: "journeyIds",
+  broadcastIds: "broadcastIds",
+  channels: "channels",
+  providers: "providers",
+  messageStates: "messageStates",
+  templateIds: "templateIds",
+  userIds: "userIds",
+} as const;
+
+export const AnalysisFilterKey = Type.Union([
+  Type.Literal(AnalysisFilterKeyEnum.journeyIds),
+  Type.Literal(AnalysisFilterKeyEnum.broadcastIds),
+  Type.Literal(AnalysisFilterKeyEnum.channels),
+  Type.Literal(AnalysisFilterKeyEnum.providers),
+  Type.Literal(AnalysisFilterKeyEnum.messageStates),
+  Type.Literal(AnalysisFilterKeyEnum.templateIds),
+  Type.Literal(AnalysisFilterKeyEnum.userIds),
+]);
+
+export type AnalysisFilterKey = Static<typeof AnalysisFilterKey>;
+
+export const AnalysisChartFilters = Type.Object({
+  journeyIds: Type.Optional(Type.Array(Type.String())),
+  broadcastIds: Type.Optional(Type.Array(Type.String())),
+  channels: Type.Optional(Type.Array(Type.String())),
+  providers: Type.Optional(Type.Array(Type.String())),
+  messageStates: Type.Optional(Type.Array(Type.String())),
+  templateIds: Type.Optional(Type.Array(Type.String())),
+  userIds: Type.Optional(Type.Array(Type.String())),
+});
+
+export type AnalysisChartFilters = Static<typeof AnalysisChartFilters>;
+
+// Group by keys that can be configured (channel and messageState are always available)
+export const AnalysisGroupByKeyEnum = {
+  journey: "journey",
+  broadcast: "broadcast",
+  messageTemplate: "messageTemplate",
+  provider: "provider",
+} as const;
+
+export const AnalysisGroupByKey = Type.Union([
+  Type.Literal(AnalysisGroupByKeyEnum.journey),
+  Type.Literal(AnalysisGroupByKeyEnum.broadcast),
+  Type.Literal(AnalysisGroupByKeyEnum.messageTemplate),
+  Type.Literal(AnalysisGroupByKeyEnum.provider),
+]);
+
+export type AnalysisGroupByKey = Static<typeof AnalysisGroupByKey>;
+
+export const AnalysisChartConfiguration = Type.Object({
+  type: Type.Literal(ComponentConfigurationEnum.AnalysisChart),
+  hardcodedFilters: Type.Optional(AnalysisChartFilters),
+  allowedFilters: Type.Optional(Type.Array(AnalysisFilterKey)),
+  allowedGroupBy: Type.Optional(Type.Array(AnalysisGroupByKey)),
+  allowedChannels: Type.Optional(Type.Array(Type.Enum(ChannelType))),
+  columnAllowList: Type.Optional(Type.Array(DeliveriesAllowedColumn)),
+  templateUriTemplate: Type.Optional(Type.String()),
+  originUriTemplate: Type.Optional(Type.String()),
+});
+
+export type AnalysisChartConfiguration = Static<
+  typeof AnalysisChartConfiguration
+>;
+
 export const ComponentConfigurationDefinition = Type.Union([
   DeliveriesTableConfiguration,
+  BroadcastConfiguration,
+  MessageTemplateConfiguration,
+  AnalysisChartConfiguration,
 ]);
 
 export type ComponentConfigurationDefinition = Static<
@@ -4822,14 +5645,47 @@ export const GetGroupsForUserResponse = Type.Object({
 
 export type GetGroupsForUserResponse = Static<typeof GetGroupsForUserResponse>;
 
+export const GetJourneysResourcesConfig = Type.Object({
+  segments: Type.Optional(Type.Boolean()),
+  messageTemplates: Type.Optional(Type.Boolean()),
+});
+
+export type GetJourneysResourcesConfig = Static<
+  typeof GetJourneysResourcesConfig
+>;
+
 export const GetResourcesRequest = Type.Object({
   workspaceId: Type.String(),
   segments: Type.Optional(Type.Boolean()),
   userProperties: Type.Optional(Type.Boolean()),
   subscriptionGroups: Type.Optional(Type.Boolean()),
+  broadcasts: Type.Optional(Type.Boolean()),
+  journeys: Type.Optional(
+    Type.Union([Type.Boolean(), GetJourneysResourcesConfig]),
+  ),
+  messageTemplates: Type.Optional(Type.Boolean()),
 });
 
 export type GetResourcesRequest = Static<typeof GetResourcesRequest>;
+
+export const MinimalJourneysResource = Type.Object({
+  id: Type.String(),
+  name: Type.String(),
+  segments: Type.Optional(Type.Array(Type.String())),
+  messageTemplates: Type.Optional(Type.Array(Type.String())),
+});
+
+export type MinimalJourneysResource = Static<typeof MinimalJourneysResource>;
+
+export const MinimalBroadcastsResource = Type.Object({
+  id: Type.String(),
+  name: Type.String(),
+  version: Type.Optional(BroadcastResourceVersion),
+});
+
+export type MinimalBroadcastsResource = Static<
+  typeof MinimalBroadcastsResource
+>;
 
 export const GetResourcesResponse = Type.Object({
   segments: Type.Optional(
@@ -4857,9 +5713,50 @@ export const GetResourcesResponse = Type.Object({
       }),
     ),
   ),
+  journeys: Type.Optional(Type.Array(MinimalJourneysResource)),
+  messageTemplates: Type.Optional(
+    Type.Array(
+      Type.Object({
+        id: Type.String(),
+        name: Type.String(),
+      }),
+    ),
+  ),
+  broadcasts: Type.Optional(Type.Array(MinimalBroadcastsResource)),
 });
 
 export type GetResourcesResponse = Static<typeof GetResourcesResponse>;
+
+export const DuplicateResourceTypeEnum = {
+  Segment: "Segment",
+  MessageTemplate: "MessageTemplate",
+  Journey: "Journey",
+  Broadcast: "Broadcast",
+  UserProperty: "UserProperty",
+} as const;
+
+export const DuplicateResourceType = Type.KeyOf(
+  Type.Const(DuplicateResourceTypeEnum),
+);
+
+export type DuplicateResourceType = Static<typeof DuplicateResourceType>;
+
+export const DuplicateResourceRequest = Type.Object({
+  workspaceId: Type.String(),
+  name: Type.String(),
+  resourceType: DuplicateResourceType,
+});
+
+export type DuplicateResourceRequest = Static<typeof DuplicateResourceRequest>;
+
+export const DuplicateResourceResponse = Type.Object({
+  id: Type.String(),
+  name: Type.String(),
+});
+
+export type DuplicateResourceResponse = Static<
+  typeof DuplicateResourceResponse
+>;
 
 export const ListDataSourceConfigurationRequest = Type.Object({
   workspaceId: Type.String(),
@@ -4884,4 +5781,693 @@ export const DeleteDataSourceConfigurationRequest = Type.Object({
 
 export type DeleteDataSourceConfigurationRequest = Static<
   typeof DeleteDataSourceConfigurationRequest
+>;
+
+export const SearchDeliveriesRequest = Type.Object({
+  workspaceId: Type.String(),
+  fromIdentifier: Type.Optional(Type.String()),
+  toIdentifier: Type.Optional(Type.String()),
+  journeyId: Type.Optional(Type.String()),
+  userId: Type.Optional(Type.Union([UserId, Type.Array(UserId)])),
+  channels: Type.Optional(Type.Array(Type.Enum(ChannelType))),
+  limit: Type.Optional(Type.Number()),
+  cursor: Type.Optional(Type.String()),
+  from: Type.Optional(Type.Array(Type.String())),
+  to: Type.Optional(Type.Array(Type.String())),
+  statuses: Type.Optional(Type.Array(Type.String())),
+  templateIds: Type.Optional(Type.Array(Type.String())),
+  startDate: Type.Optional(Type.String()),
+  endDate: Type.Optional(Type.String()),
+  sortBy: Type.Optional(SearchDeliveriesRequestSortBy),
+  sortDirection: Type.Optional(SortDirection),
+  broadcastId: Type.Optional(Type.String()),
+  triggeringProperties: Type.Optional(
+    Type.Array(
+      Type.Object({
+        key: Type.String(),
+        value: Type.Union([Type.String(), Type.Number()]),
+      }),
+    ),
+  ),
+  groupId: Type.Optional(
+    Type.Union([Type.String(), Type.Array(Type.String())]),
+  ),
+  contextValues: Type.Optional(
+    Type.Array(
+      Type.Object({
+        key: Type.String(),
+        value: Type.Union([Type.String(), Type.Number()]),
+      }),
+    ),
+  ),
+});
+
+export type SearchDeliveriesRequest = Static<typeof SearchDeliveriesRequest>;
+
+export const DownloadDeliveriesRequest = Type.Omit(SearchDeliveriesRequest, [
+  "limit",
+  "cursor",
+]);
+
+export type DownloadDeliveriesRequest = Static<
+  typeof DownloadDeliveriesRequest
+>;
+
+export const BroadcastConfigTypeEnum = {
+  V2: "V2",
+} as const;
+
+export const BroadcastConfigType = Type.KeyOf(
+  Type.Const(BroadcastConfigTypeEnum),
+);
+
+export type BroadcastConfigType = Static<typeof BroadcastConfigType>;
+
+export const BroadcastErrorHandlingEnum = {
+  PauseOnError: "PauseOnError",
+  SkipOnError: "SkipOnError",
+} as const;
+
+export const BroadcastErrorHandling = Type.KeyOf(
+  Type.Const(BroadcastErrorHandlingEnum),
+);
+
+export type BroadcastErrorHandling = Static<typeof BroadcastErrorHandling>;
+
+export const BroadcastEmailMessageVariant = Type.Object({
+  type: Type.Literal(ChannelType.Email),
+  providerOverride: Type.Optional(Type.Enum(EmailProviderType)),
+});
+
+export type BroadcastEmailMessageVariant = Static<
+  typeof BroadcastEmailMessageVariant
+>;
+
+export const BaseBroadcastSmsMessageVariant = Type.Object({
+  type: Type.Literal(ChannelType.Sms),
+});
+
+export const BroadcastSmsMessageVariant = Type.Union([
+  Type.Composite([BaseBroadcastSmsMessageVariant, NoSmsProviderOverride]),
+  Type.Composite([BaseBroadcastSmsMessageVariant, TwilioOverride]),
+  Type.Composite([BaseBroadcastSmsMessageVariant, SignalWireOverride]),
+  Type.Composite([BaseBroadcastSmsMessageVariant, TestSmsOverride]),
+]);
+
+export type BroadcastSmsMessageVariant = Static<
+  typeof BroadcastSmsMessageVariant
+>;
+export const BroadcastV2Config = Type.Object({
+  type: Type.Literal(BroadcastConfigTypeEnum.V2),
+  // messages per second
+  rateLimit: Type.Optional(Type.Number()),
+  defaultTimezone: Type.Optional(Type.String()),
+  useIndividualTimezone: Type.Optional(Type.Boolean()),
+  errorHandling: Type.Optional(BroadcastErrorHandling),
+  batchSize: Type.Optional(Type.Number()),
+  message: Type.Union([
+    // Defined separately to allow workspace member specific providers.
+    BroadcastEmailMessageVariant,
+    BroadcastSmsMessageVariant,
+    Type.Omit(WebhookMessageVariant, ["templateId"]),
+  ]),
+});
+
+export type BroadcastV2Config = Static<typeof BroadcastV2Config>;
+
+export const BroadcastV2StatusEnum = {
+  Draft: "Draft",
+  Scheduled: "Scheduled",
+  Running: "Running",
+  Paused: "Paused",
+  Completed: "Completed",
+  Cancelled: "Cancelled",
+  Failed: "Failed",
+} as const;
+
+export const BroadcastV2Status = Type.KeyOf(Type.Const(BroadcastV2StatusEnum));
+
+export type BroadcastV2Status = Static<typeof BroadcastV2Status>;
+
+export const BroadcastResourceV2 = Type.Object({
+  id: Type.String(),
+  workspaceId: Type.String(),
+  name: Type.String(),
+  segmentId: Type.Optional(Type.String()),
+  messageTemplateId: Type.Optional(Type.String()),
+  subscriptionGroupId: Type.Optional(Type.String()),
+  config: BroadcastV2Config,
+  status: BroadcastV2Status,
+  scheduledAt: Type.Optional(Type.String()),
+  createdAt: Type.Number(),
+  updatedAt: Type.Number(),
+  archived: Type.Optional(Type.Boolean()),
+  version: Type.Literal(BroadcastResourceVersionEnum.V2),
+});
+
+export type BroadcastResourceV2 = Static<typeof BroadcastResourceV2>;
+
+export const UpsertBroadcastV2ErrorTypeEnum = {
+  IdError: "IdError",
+  UniqueConstraintViolation: "UniqueConstraintViolation",
+  MissingRequiredFields: "MissingRequiredFields",
+  ConstraintViolation: "ConstraintViolation",
+} as const;
+
+export const UpsertBroadcastV2ErrorType = Type.KeyOf(
+  Type.Const(UpsertBroadcastV2ErrorTypeEnum),
+);
+
+export type UpsertBroadcastV2ErrorType = Static<
+  typeof UpsertBroadcastV2ErrorType
+>;
+
+export const UpsertBroadcastV2Error = Type.Object({
+  type: UpsertBroadcastV2ErrorType,
+  message: Type.String(),
+});
+
+export type UpsertBroadcastV2Error = Static<typeof UpsertBroadcastV2Error>;
+
+export const ComputedPropertyTypeEnum = {
+  Segment: "Segment",
+  UserProperty: "UserProperty",
+} as const;
+
+export const ComputedPropertyType = Type.KeyOf(
+  Type.Const(ComputedPropertyTypeEnum),
+);
+
+export type ComputedPropertyType = Static<typeof ComputedPropertyType>;
+
+export const ComputedPropertyStepEnum = {
+  ComputeState: "ComputeState",
+  ComputeAssignments: "ComputeAssignments",
+  ProcessAssignments: "ProcessAssignments",
+} as const;
+
+export const ComputedPropertyStep = Type.KeyOf(
+  Type.Const(ComputedPropertyStepEnum),
+);
+
+export type ComputedPropertyStep = Static<typeof ComputedPropertyStep>;
+
+export const GetComputedPropertyPeriodsRequest = Type.Object({
+  workspaceId: Type.String(),
+  step: ComputedPropertyStep,
+});
+
+export type GetComputedPropertyPeriodsRequest = Static<
+  typeof GetComputedPropertyPeriodsRequest
+>;
+
+export const ComputedPropertyPeriod = Type.Object({
+  id: Type.String(),
+  workspaceId: Type.String(),
+  type: ComputedPropertyType,
+  lastRecomputed: Type.String(),
+});
+
+export type ComputedPropertyPeriod = Static<typeof ComputedPropertyPeriod>;
+
+export const GetComputedPropertyPeriodsResponse = Type.Object({
+  periods: Type.Array(ComputedPropertyPeriod),
+});
+
+export type GetComputedPropertyPeriodsResponse = Static<
+  typeof GetComputedPropertyPeriodsResponse
+>;
+
+export const TriggerRecomputeRequest = Type.Object({
+  workspaceId: Type.String(),
+});
+
+export type TriggerRecomputeRequest = Static<typeof TriggerRecomputeRequest>;
+
+export const BaseUpsertBroadcastV2Request = Type.Object({
+  workspaceId: Type.String(),
+  segmentId: NullableAndOptional(Type.String()),
+  messageTemplateId: NullableAndOptional(Type.String()),
+  subscriptionGroupId: NullableAndOptional(Type.String()),
+  config: Type.Optional(BroadcastV2Config),
+  scheduledAt: NullableAndOptional(Type.String()),
+});
+
+export type BaseUpsertBroadcastV2Request = Static<
+  typeof BaseUpsertBroadcastV2Request
+>;
+
+export const UpsertBroadcastV2Request = Type.Intersect([
+  BaseUpsertBroadcastV2Request,
+  IdOrName,
+]);
+
+export type UpsertBroadcastV2Request = Static<typeof UpsertBroadcastV2Request>;
+
+export const BroadcastResourceAllVersions = Type.Union([
+  BroadcastResourceV2,
+  BroadcastResource,
+]);
+
+export type BroadcastResourceAllVersions = Static<
+  typeof BroadcastResourceAllVersions
+>;
+
+export const GetBroadcastsResponse = Type.Array(BroadcastResourceAllVersions);
+
+export type GetBroadcastsResponse = Static<typeof GetBroadcastsResponse>;
+
+export const GetBroadcastsV2Request = Type.Object({
+  workspaceId: Type.String(),
+  ids: Type.Optional(Type.Array(Type.String())),
+});
+
+export type GetBroadcastsV2Request = Static<typeof GetBroadcastsV2Request>;
+
+export const UpdateBroadcastArchiveRequest = Type.Object({
+  workspaceId: Type.String(),
+  broadcastId: Type.String(),
+  archived: Type.Optional(Type.Boolean()),
+});
+
+export type UpdateBroadcastArchiveRequest = Static<
+  typeof UpdateBroadcastArchiveRequest
+>;
+
+export const RecomputeBroadcastSegmentRequest = Type.Object({
+  workspaceId: Type.String(),
+  broadcastId: Type.String(),
+});
+
+export type RecomputeBroadcastSegmentRequest = Static<
+  typeof RecomputeBroadcastSegmentRequest
+>;
+
+export const StartBroadcastRequest = Type.Object({
+  workspaceId: Type.String(),
+  broadcastId: Type.String(),
+});
+
+export type StartBroadcastRequest = Static<typeof StartBroadcastRequest>;
+
+export const PauseBroadcastRequest = Type.Object({
+  workspaceId: Type.String(),
+  broadcastId: Type.String(),
+});
+
+export type PauseBroadcastRequest = Static<typeof PauseBroadcastRequest>;
+
+export const ResumeBroadcastRequest = Type.Object({
+  workspaceId: Type.String(),
+  broadcastId: Type.String(),
+});
+
+export type ResumeBroadcastRequest = Static<typeof ResumeBroadcastRequest>;
+
+export const CancelBroadcastRequest = Type.Object({
+  workspaceId: Type.String(),
+  broadcastId: Type.String(),
+});
+
+export type CancelBroadcastRequest = Static<typeof CancelBroadcastRequest>;
+
+export const UpdateManualSegmentUsersRequest = Type.Composite([
+  Type.Object({
+    workspaceId: Type.String(),
+    segmentId: Type.String(),
+    userIds: Type.Array(Type.String()),
+    append: Type.Optional(Type.Boolean()),
+    sync: Type.Optional(Type.Boolean()),
+  }),
+]);
+
+export type UpdateManualSegmentUsersRequest = Static<
+  typeof UpdateManualSegmentUsersRequest
+>;
+
+export const GetManualSegmentStatusRequest = Type.Object({
+  workspaceId: Type.String(),
+  segmentId: Type.String(),
+});
+
+export type GetManualSegmentStatusRequest = Static<
+  typeof GetManualSegmentStatusRequest
+>;
+
+export const GetManualSegmentStatusResponse = Type.Object({
+  lastComputedAt: Nullable(Type.String()),
+});
+
+export type GetManualSegmentStatusResponse = Static<
+  typeof GetManualSegmentStatusResponse
+>;
+
+export const ClearManualSegmentRequest = Type.Object({
+  workspaceId: Type.String(),
+  segmentId: Type.String(),
+});
+
+export type ClearManualSegmentRequest = Static<
+  typeof ClearManualSegmentRequest
+>;
+
+export const ManualSegmentUpdateEventProperties = Type.Object({
+  segmentId: Type.String(),
+  version: Type.Number(),
+  // represent a boolean value as a number 0 or 1
+  inSegment: Type.Number(),
+});
+
+export type ManualSegmentUpdateEventProperties = Static<
+  typeof ManualSegmentUpdateEventProperties
+>;
+
+export const GetGmailAuthorizationRequest = Type.Object({
+  workspaceId: Type.String(),
+});
+
+export type GetGmailAuthorizationRequest = Static<
+  typeof GetGmailAuthorizationRequest
+>;
+
+export const GetGmailAuthorizationResponse = Type.Object({
+  authorized: Type.Boolean(),
+});
+
+export type GetGmailAuthorizationResponse = Static<
+  typeof GetGmailAuthorizationResponse
+>;
+
+export interface EmbeddedSession {
+  workspaceId: string;
+  occupantId?: string;
+}
+
+export const OauthFlowEnum = {
+  PopUp: "PopUp",
+  Redirect: "Redirect",
+} as const;
+
+export const OauthFlow = Type.KeyOf(Type.Const(OauthFlowEnum));
+export type OauthFlow = Static<typeof OauthFlow>;
+
+export const SetCsrfCookieRequest = Type.Object({
+  workspaceId: Type.String(),
+  csrfToken: Type.String(),
+  expiresAt: Type.String({ format: "date-time" }), // Expect ISO date string
+});
+
+export type SetCsrfCookieRequest = Static<typeof SetCsrfCookieRequest>;
+
+export interface UserEventV2 {
+  event_type: string;
+  event: string;
+  event_time: string;
+  message_id: string;
+  user_id: string;
+  anonymous_id: string;
+  user_or_anonymous_id: string;
+  properties: string;
+  processing_time: string;
+  message_raw: string;
+  workspace_id: string;
+}
+
+export const BaseBatchMessageUsersRequestUser = Type.Object({
+  id: Type.String(),
+  messageId: Type.Optional(
+    Type.String({
+      description:
+        "Message Id to set on the tracked event. If not provided, a message id will be generated.",
+    }),
+  ),
+  properties: Type.Record(Type.String(), Type.Any(), {
+    description:
+      "User property values to be rendered in the message, keyed by name. Will override values present on the user.",
+  }),
+  context: Type.Optional(
+    Type.Record(Type.String(), Type.Any(), {
+      description:
+        "Context values for this specific user's events. Will override batch-level context values.",
+    }),
+  ),
+});
+
+export type BaseBatchMessageUsersRequestUser = Static<
+  typeof BaseBatchMessageUsersRequestUser
+>;
+
+export const BaseBatchMessageUsersRequest = {
+  workspaceId: Type.String(),
+  templateId: Type.String(),
+  subscriptionGroupId: Type.Optional(Type.String()),
+  users: Type.Array(BaseBatchMessageUsersRequestUser),
+  context: Type.Optional(Type.Record(Type.String(), Type.Any())),
+};
+
+export const EmailBatchMessageUsersRequest = Type.Object({
+  ...BaseBatchMessageUsersRequest,
+  channel: Type.Literal(ChannelType.Email),
+  provider: Type.Optional(Type.Enum(EmailProviderType)),
+});
+
+export type EmailBatchMessageUsersRequest = Static<
+  typeof EmailBatchMessageUsersRequest
+>;
+
+export const SmsBatchMessageUsersRequest = Type.Object({
+  ...BaseBatchMessageUsersRequest,
+  channel: Type.Literal(ChannelType.Sms),
+  provider: Type.Optional(Type.Enum(SmsProviderType)),
+});
+
+export type SmsBatchMessageUsersRequest = Static<
+  typeof SmsBatchMessageUsersRequest
+>;
+
+export const WebBatchMessageUsersRequest = Type.Object({
+  ...BaseBatchMessageUsersRequest,
+  channel: Type.Literal(ChannelType.Webhook),
+  provider: Type.Optional(Type.Null()),
+});
+
+export type WebBatchMessageUsersRequest = Static<
+  typeof WebBatchMessageUsersRequest
+>;
+
+export const BatchMessageUsersRequest = Type.Union([
+  EmailBatchMessageUsersRequest,
+  SmsBatchMessageUsersRequest,
+  WebBatchMessageUsersRequest,
+]);
+
+export type BatchMessageUsersRequest = Static<typeof BatchMessageUsersRequest>;
+
+export const BatchMessageUsersResultTypeEnum = {
+  Success: "Success",
+  Skipped: "Skipped",
+  RetryableError: "RetryableError",
+  NonRetryableError: "NonRetryableError",
+} as const;
+
+export const BatchMessageUsersResultType = Type.KeyOf(
+  Type.Const(BatchMessageUsersResultTypeEnum),
+);
+
+export type BatchMessageUsersResultType = Static<
+  typeof BatchMessageUsersResultType
+>;
+
+export const BaseBatchMessageUsersResult = {
+  userId: Type.String(),
+};
+
+export const BatchMessageUsersResultRetryableError = Type.Object({
+  ...BaseBatchMessageUsersResult,
+  type: Type.Literal(BatchMessageUsersResultTypeEnum.RetryableError),
+  messageId: Type.String(),
+  error: Type.Composite([
+    Type.Record(Type.String(), Type.Any()),
+    Type.Object({
+      message: Type.String(),
+    }),
+  ]),
+});
+
+export type BatchMessageUsersResultRetryableError = Static<
+  typeof BatchMessageUsersResultRetryableError
+>;
+
+export const BatchMessageUsersResult = Type.Union([
+  Type.Object({
+    ...BaseBatchMessageUsersResult,
+    type: Type.Literal(BatchMessageUsersResultTypeEnum.Success),
+    messageId: Type.String(),
+  }),
+  Type.Object({
+    ...BaseBatchMessageUsersResult,
+    type: Type.Literal(BatchMessageUsersResultTypeEnum.Skipped),
+    reason: Type.String(),
+    messageId: Type.String(),
+  }),
+  BatchMessageUsersResultRetryableError,
+  Type.Object({
+    ...BaseBatchMessageUsersResult,
+    type: Type.Literal(BatchMessageUsersResultTypeEnum.NonRetryableError),
+    messageId: Type.String(),
+    error: NonRetryableMessageSendFailure,
+  }),
+]);
+
+export type BatchMessageUsersResult = Static<typeof BatchMessageUsersResult>;
+
+export const BatchMessageUsersResponse = Type.Object({
+  results: Type.Array(BatchMessageUsersResult),
+});
+
+export type BatchMessageUsersResponse = Static<
+  typeof BatchMessageUsersResponse
+>;
+
+export const GetAnalysisRequest = Type.Object({
+  workspaceId: Type.String(),
+  channel: Type.Optional(Type.Enum(ChannelType)),
+  provider: Type.Optional(Type.Enum(EmailProviderType)),
+  userId: Type.Optional(Type.String()),
+  startDate: Type.Optional(Type.String()),
+  endDate: Type.Optional(Type.String()),
+  journeyId: Type.Optional(Type.String()),
+  broadcastId: Type.Optional(Type.String()),
+});
+
+export type GetAnalysisRequest = Static<typeof GetAnalysisRequest>;
+
+// Analysis Dashboard Types
+export const ChartGranularity = Type.Union([
+  Type.Literal("auto"),
+  Type.Literal("30second"),
+  Type.Literal("1minute"),
+  Type.Literal("5minutes"),
+  Type.Literal("10minutes"),
+  Type.Literal("30minutes"),
+  Type.Literal("1hour"),
+  Type.Literal("6hours"),
+  Type.Literal("12hours"),
+  Type.Literal("1day"),
+  Type.Literal("7days"),
+  Type.Literal("30days"),
+]);
+
+export type ChartGranularity = Static<typeof ChartGranularity>;
+
+export const GetChartDataRequest = Type.Object({
+  workspaceId: Type.String(),
+  startDate: Type.String(),
+  endDate: Type.String(),
+  granularity: Type.Optional(ChartGranularity),
+  groupBy: Type.Optional(
+    Type.Union([
+      Type.Literal("journey"),
+      Type.Literal("broadcast"),
+      Type.Literal("messageTemplate"),
+      Type.Literal("channel"),
+      Type.Literal("provider"),
+      Type.Literal("messageState"),
+    ]),
+  ),
+  filters: Type.Optional(AnalysisChartFilters),
+});
+
+export type GetChartDataRequest = Static<typeof GetChartDataRequest>;
+
+export const GetSummarizedDataRequest = Type.Object({
+  workspaceId: Type.String(),
+  startDate: Type.String(),
+  endDate: Type.String(),
+  filters: Type.Optional(
+    Type.Object({
+      journeyIds: Type.Optional(Type.Array(Type.String())),
+      broadcastIds: Type.Optional(Type.Array(Type.String())),
+      channel: Type.Optional(Type.Enum(ChannelType)),
+      providers: Type.Optional(Type.Array(Type.String())),
+      messageStates: Type.Optional(Type.Array(Type.String())),
+      templateIds: Type.Optional(Type.Array(Type.String())),
+      userIds: Type.Optional(Type.Array(Type.String())),
+    }),
+  ),
+});
+
+export type GetSummarizedDataRequest = Static<typeof GetSummarizedDataRequest>;
+
+export const ChartDataPoint = Type.Object({
+  timestamp: Type.String(),
+  count: Type.Number(),
+  groupKey: Type.Optional(Type.String()),
+  groupLabel: Type.Optional(Type.String()),
+});
+
+export type ChartDataPoint = Static<typeof ChartDataPoint>;
+
+export const ResolvedChartGranularity = Type.Union([
+  Type.Literal("30second"),
+  Type.Literal("1minute"),
+  Type.Literal("5minutes"),
+  Type.Literal("10minutes"),
+  Type.Literal("30minutes"),
+  Type.Literal("1hour"),
+  Type.Literal("6hours"),
+  Type.Literal("12hours"),
+  Type.Literal("1day"),
+  Type.Literal("7days"),
+  Type.Literal("30days"),
+]);
+
+export type ResolvedChartGranularity = Static<typeof ResolvedChartGranularity>;
+
+export const GetChartDataResponse = Type.Object({
+  data: Type.Array(ChartDataPoint),
+  granularity: ResolvedChartGranularity,
+});
+
+export type GetChartDataResponse = Static<typeof GetChartDataResponse>;
+
+export const SummaryMetric = Type.Object({
+  deliveries: Type.Number(),
+  sent: Type.Number(),
+  opens: Type.Number(),
+  clicks: Type.Number(),
+  bounces: Type.Number(),
+});
+
+export type SummaryMetric = Static<typeof SummaryMetric>;
+
+export const GetSummarizedDataResponse = Type.Object({
+  summary: SummaryMetric,
+});
+
+export type GetSummarizedDataResponse = Static<
+  typeof GetSummarizedDataResponse
+>;
+
+export const GetJourneyEditorStatsRequest = Type.Object({
+  workspaceId: Type.String(),
+  journeyId: Type.String(),
+  startDate: Type.String(),
+  endDate: Type.String(),
+});
+
+export type GetJourneyEditorStatsRequest = Static<
+  typeof GetJourneyEditorStatsRequest
+>;
+
+export const JourneyNodeStats = Type.Record(Type.String(), Type.Number());
+
+export type JourneyNodeStats = Static<typeof JourneyNodeStats>;
+
+export const GetJourneyEditorStatsResponse = Type.Object({
+  nodeStats: Type.Record(Type.String(), JourneyNodeStats),
+});
+
+export type GetJourneyEditorStatsResponse = Static<
+  typeof GetJourneyEditorStatsResponse
 >;

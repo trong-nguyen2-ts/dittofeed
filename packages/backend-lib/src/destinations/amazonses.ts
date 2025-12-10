@@ -15,12 +15,15 @@ import {
   schemaValidateWithErr,
 } from "isomorphic-lib/src/resultHandling/schemaValidation";
 import { err, ok, Result, ResultAsync } from "neverthrow";
+import MailComposer from "nodemailer/lib/mail-composer";
+import Mail from "nodemailer/lib/mailer";
 import * as R from "remeda";
 import SnsPayloadValidator from "sns-payload-validator";
 import { Overwrite } from "utility-types";
 import { v5 as uuidv5 } from "uuid";
 
 import { submitBatch } from "../apps/batch";
+import { canWorkspaceReceiveEventsById } from "../auth";
 import { MESSAGE_METADATA_FIELDS } from "../constants";
 import logger from "../logger";
 import { withSpan } from "../openTelemetry";
@@ -39,19 +42,14 @@ import {
   InternalEventType,
 } from "../types";
 
-// README the typescript types on this are wrong, body is not of type string,
-// it's a parsed JSON object
-function guardResponseError(e: unknown): SESv2ServiceException {
-  if (e instanceof SESv2ServiceException) {
-    return e;
-  }
-  throw e;
-}
-
 export type SesMailData = Overwrite<
   AmazonSesMailFields,
-  { tags?: Record<string, string> }
->;
+  {
+    tags?: Record<string, string>;
+  }
+> & {
+  attachments?: Mail.Attachment[];
+};
 
 export async function sendMail({
   config,
@@ -59,7 +57,7 @@ export async function sendMail({
 }: {
   config: AmazonSesConfig;
   mailData: SesMailData;
-}): Promise<Result<SendEmailCommandOutput, SESv2ServiceException>> {
+}): Promise<Result<SendEmailCommandOutput, SESv2ServiceException | unknown>> {
   const { accessKeyId, secretAccessKey, region } = config;
   const client = new SESv2Client({
     region,
@@ -76,48 +74,106 @@ export async function sendMail({
       }))
     : undefined;
 
-  logger().info(
-    {
-      tags,
-    },
-    "sending ses tags",
-  );
+  // Process attachments if they exist
+  const attachments = Array.isArray(mailData.attachments)
+    ? mailData.attachments
+    : [];
 
-  // TODO: Add cc and bcc and attachments
+  // Create mail options for MailComposer
+  // Note: Bcc is excluded from MIME headers for privacy - SES v2 uses Destination.BccAddresses instead
+  const mailOptions: Mail.Options = {
+    from: mailData.from,
+    to: mailData.to,
+    subject: mailData.subject,
+    cc: mailData.cc,
+    html: mailData.html,
+    attachments,
+    headers: mailData.headers,
+    replyTo: mailData.replyTo,
+  };
+
+  if (mailData.replyTo) {
+    mailOptions.replyTo = mailData.replyTo;
+  }
+
+  // Use MailComposer to create raw email content
+  const mailComposer = new MailComposer(mailOptions);
+
+  let rawEmailContent: Buffer;
+  try {
+    // Build the message
+    rawEmailContent = await mailComposer.compile().build();
+  } catch (error) {
+    logger().info(
+      {
+        err: error,
+        templateId: mailData.tags?.templateId,
+        workspaceId: mailData.tags?.workspaceId,
+      },
+      "Error sending ses email",
+    );
+    return err(error);
+  }
+
+  // Always use the Raw content interface with explicit destination parameters
   const input: SendEmailRequest = {
     FromEmailAddress: mailData.from,
     Destination: {
-      ToAddresses: [mailData.to],
+      ToAddresses: Array.isArray(mailData.to) ? mailData.to : [mailData.to],
+      CcAddresses: mailData.cc,
+      BccAddresses: mailData.bcc,
     },
     Content: {
-      Simple: {
-        Subject: {
-          Data: mailData.subject,
-          Charset: "UTF-8",
-        },
-        Body: {
-          Html: {
-            Data: mailData.html,
-            Charset: "UTF-8",
-          },
-        },
-        Headers: mailData.headers
-          ? Object.entries(mailData.headers).map(([Name, Value]) => ({
-              Name,
-              Value,
-            }))
-          : undefined,
+      Raw: {
+        Data: Uint8Array.from(rawEmailContent),
       },
     },
     EmailTags: tags,
-    ReplyToAddresses: mailData.replyTo ? [mailData.replyTo] : undefined,
   };
+
+  // Add ReplyToAddresses if specified
+  if (mailData.replyTo) {
+    input.ReplyToAddresses = Array.isArray(mailData.replyTo)
+      ? mailData.replyTo
+      : [mailData.replyTo];
+  }
+
+  logger().debug(
+    {
+      from: input.FromEmailAddress,
+      destination: input.Destination,
+      tags: input.EmailTags,
+    },
+    "sending ses email",
+  );
 
   const command = new SendEmailCommand(input);
 
-  return ResultAsync.fromPromise(client.send(command), guardResponseError).map(
-    (resultArray) => resultArray,
-  );
+  try {
+    const result = await client.send(command);
+    return ok(result);
+  } catch (error) {
+    if (error instanceof SESv2ServiceException && !error.$retryable) {
+      logger().info(
+        {
+          err: error,
+          workspaceId: mailData.tags?.workspaceId,
+          templateId: mailData.tags?.templateId,
+        },
+        "Non-retryable error sending ses email",
+      );
+      return err(error);
+    }
+    logger().error(
+      {
+        err: error,
+        workspaceId: mailData.tags?.workspaceId,
+        templateId: mailData.tags?.templateId,
+      },
+      "Retryable error sending ses email",
+    );
+    throw error;
+  }
 }
 
 export async function submitAmazonSesEvents(
@@ -150,6 +206,10 @@ export async function submitAmazonSesEvents(
       return err(new Error("Workspace id not found"));
     }
 
+    if (!(await canWorkspaceReceiveEventsById({ workspaceId }))) {
+      return err(new Error("Workspace not eligible"));
+    }
+
     let timestamp: string;
     let eventName: InternalEventType;
     switch (event.eventType) {
@@ -179,7 +239,10 @@ export async function submitAmazonSesEvents(
         );
     }
 
-    const messageId = uuidv5(event.mail.messageId, workspaceId);
+    const messageId = uuidv5(
+      `${event.eventType}:${event.mail.messageId}`,
+      workspaceId,
+    );
     const metadataTags = R.pick(tags, MESSAGE_METADATA_FIELDS);
 
     const items: BatchTrackData[] = [];

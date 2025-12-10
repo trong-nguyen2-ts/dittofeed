@@ -13,6 +13,8 @@ import {
 
 import type * as activities from "../temporal/activities";
 import { Semaphore } from "../temporal/semaphore";
+import { WorkspaceQueueItem } from "../types";
+import { generateKeyFromItem, getWorkspaceIdFromItem } from "./queueUtils";
 
 
 export const COMPUTE_PROPERTIES_QUEUE_WORKFLOW_ID =
@@ -24,7 +26,24 @@ export const addWorkspacesSignal = defineSignal<[string[]]>(
   "addWorkspacesSignal",
 );
 
+export interface WorkspaceQueueSignal {
+  workspaces: WorkspaceQueueItem[];
+}
+
+export const addWorkspacesSignalV2 = defineSignal<[WorkspaceQueueSignal]>(
+  "addWorkspacesSignalV2",
+);
+
 export const getQueueSizeQuery = defineQuery<number>("getQueueSizeQuery");
+
+export interface QueueState {
+  priorityQueue: WorkspaceQueueItem[];
+  membership: string[];
+  inFlightTaskIds: string[];
+  totalProcessed: number;
+}
+
+export const getQueueStateQuery = defineQuery<QueueState>("getQueueStateQuery");
 
 /**
  * Activities
@@ -33,23 +52,60 @@ const { config } = proxyActivities<typeof activities>({
   startToCloseTimeout: "30 minutes",
 });
 
-/**
- * The workflow parameters now only include `queueState`.
- * We no longer accept concurrency, capacity, or maxLoopIterations from params;
- * instead, we pull those from the `config` activity at runtime.
- */
 export interface ComputePropertiesQueueWorkflowParams {
-  /**
-   * The current queue of workspace IDs (FIFO) carried across `continueAsNew`.
-   * We'll infer membership from this queue at startup.
-   */
   queueState?: string[];
+  // TODO handle
+  queueStateV2?: WorkspaceQueueItem[];
+  continueAsNew?: boolean;
+}
+
+interface InFlightTask {
+  task: Promise<void>;
+  key: string;
+}
+
+/**
+ * Comparator function for WorkspaceQueueItems that implements priority ordering:
+ * 1. Higher priority (higher number) comes first
+ * 2. Longer period comes first
+ * 3. Earlier insertion order comes first
+ */
+export function compareWorkspaceItems(
+  a: WorkspaceQueueItem,
+  b: WorkspaceQueueItem,
+): number {
+  // First, compare by priority (undefined is lowest priority)
+  if (a.priority !== undefined && b.priority === undefined) return -1;
+  if (a.priority === undefined && b.priority !== undefined) return 1;
+  if (a.priority !== undefined && b.priority !== undefined) {
+    if (a.priority !== b.priority) return b.priority - a.priority; // Reverse the order so higher numbers come first
+  }
+
+  const aPeriod = a.period ?? a.maxPeriod;
+  const bPeriod = b.period ?? b.maxPeriod;
+  // Next, compare by maxPeriod (undefined comes FIRST)
+  if (aPeriod === undefined && bPeriod !== undefined) return -1; // a (undefined) comes first
+  if (aPeriod !== undefined && bPeriod === undefined) return 1; // b (undefined) comes first
+  if (aPeriod !== undefined && bPeriod !== undefined) {
+    // If both are defined, longer maxPeriod comes first
+    if (aPeriod !== bPeriod) return aPeriod - bPeriod;
+  }
+
+  // Finally, compare by insertion order
+  if (a.insertedAt !== undefined && b.insertedAt !== undefined) {
+    return a.insertedAt - b.insertedAt;
+  }
+
+  const aKey = generateKeyFromItem(a);
+  const bKey = generateKeyFromItem(b);
+  // If no insertedAt, fall back to string key comparison
+  return aKey.localeCompare(bKey);
 }
 
 /**
  * A single-loop streaming concurrency workflow that:
  * - Reads concurrency, capacity, maxLoopIterations from a config activity
- * - Maintains a queue of items (up to `capacity`)
+ * - Maintains a priority queue of items (up to `capacity`)
  * - Uses a Semaphore to allow up to `concurrency` tasks in flight
  * - Processes one item per loop iteration (streaming approach)
  * - Calls `continueAsNew` after it has processed `maxLoopIterations` total items
@@ -58,11 +114,36 @@ export interface ComputePropertiesQueueWorkflowParams {
 export async function computePropertiesQueueWorkflow(
   params: ComputePropertiesQueueWorkflowParams,
 ) {
-  // 1) Rehydrate the queue from previous run (if any)
-  const queue: string[] = params.queueState ?? [];
+  // 1) Initialize priority queue from previous run (if any)
+  const priorityQueue: WorkspaceQueueItem[] = [];
+  const membership = new Set<string>();
 
-  // 2) Initialize a Set to avoid duplicates in the queue
-  const membership = new Set<string>(queue);
+  // Handle backward compatibility with queueState (string array)
+  if (params.queueState && params.queueState.length > 0) {
+    const now = Date.now();
+    for (const workspaceId of params.queueState) {
+      const key = generateKeyFromItem({ id: workspaceId });
+      if (workspaceId && !membership.has(key)) {
+        const item: WorkspaceQueueItem = {
+          id: workspaceId,
+          insertedAt: now, // Use current timestamp
+        };
+        priorityQueue.push(item);
+        membership.add(key);
+      }
+    }
+  }
+
+  // Handle queueStateV2 (WorkspaceQueueItem array)
+  if (params.queueStateV2 && params.queueStateV2.length > 0) {
+    for (const item of params.queueStateV2) {
+      const key = generateKeyFromItem(item);
+      if (!membership.has(key)) {
+        priorityQueue.push(item);
+        membership.add(key);
+      }
+    }
+  }
 
   // 3) Load concurrency, capacity, and maxLoopIterations from config
   const initialConfig = await config([
@@ -70,14 +151,19 @@ export async function computePropertiesQueueWorkflow(
     "computePropertiesQueueCapacity",
     "computePropertiesAttempts",
     "computedPropertiesActivityTaskQueue",
+    "computePropertiesTimeout",
   ]);
   const concurrency = initialConfig.computePropertiesQueueConcurrency;
   const capacity = initialConfig.computePropertiesQueueCapacity;
   const maxLoopIterations = initialConfig.computePropertiesAttempts;
 
-  const { computePropertiesContained } = proxyActivities<typeof activities>({
-    startToCloseTimeout: "30 minutes",
+  const { computePropertiesContainedV2 } = proxyActivities<typeof activities>({
+    startToCloseTimeout: initialConfig.computePropertiesTimeout,
     taskQueue: initialConfig.computedPropertiesActivityTaskQueue,
+    retry: {
+      // Don't retry the activity if it fails, because retries are built into the queue + scheduler workflow
+      maximumAttempts: 1,
+    },
   });
 
   logger.info("Loaded config values", {
@@ -93,19 +179,43 @@ export async function computePropertiesQueueWorkflow(
   // We'll track how many items we've processed in this run
   let totalProcessed = 0;
   // Keep track of in-flight tasks so we can wait before continueAsNew
-  const inFlight: Promise<void>[] = [];
+  const inFlight: InFlightTask[] = [];
 
   //
-  // SIGNAL HANDLER: Add new workspaces (up to capacity, no duplicates)
+  // SIGNAL HANDLER: Add new workspaces (backward compatible)
   //
   setHandler(addWorkspacesSignal, (workspaceIds: string[]) => {
-    logger.info("Queue: Adding new workspaces", {
+    logger.info("Queue: Adding new workspaces (legacy signal)", {
       workspaceIdsCount: workspaceIds.length,
     });
-    for (const w of workspaceIds) {
-      if (queue.length < capacity && !membership.has(w)) {
-        queue.push(w);
-        membership.add(w);
+
+    const now = Date.now();
+    for (const id of workspaceIds) {
+      const key = generateKeyFromItem({ id });
+      if (id && priorityQueue.length < capacity && !membership.has(key)) {
+        const queueItem: WorkspaceQueueItem = {
+          id,
+          insertedAt: now, // Use timestamp
+        };
+        priorityQueue.push(queueItem);
+        membership.add(generateKeyFromItem(queueItem));
+      }
+    }
+  });
+
+  //
+  // SIGNAL HANDLER: Add new workspace queue items
+  //
+  setHandler(addWorkspacesSignalV2, (signal: WorkspaceQueueSignal) => {
+    logger.info("Queue: Adding new workspaces (v2 signal)", {
+      workspaceIdsCount: signal.workspaces.length,
+    });
+
+    for (const item of signal.workspaces) {
+      const key = generateKeyFromItem(item);
+      if (priorityQueue.length < capacity && !membership.has(key)) {
+        priorityQueue.push(item);
+        membership.add(key);
       }
     }
   });
@@ -113,25 +223,43 @@ export async function computePropertiesQueueWorkflow(
   //
   // QUERY HANDLER: Return how many items are in the queue
   //
-  setHandler(getQueueSizeQuery, () => queue.length);
+  setHandler(getQueueSizeQuery, () => priorityQueue.length);
+
+  //
+  // QUERY HANDLER: Return detailed queue state
+  //
+  setHandler(
+    getQueueStateQuery,
+    (): QueueState => ({
+      priorityQueue,
+      membership: Array.from(membership),
+      inFlightTaskIds: inFlight.map((task) => task.key),
+      totalProcessed,
+    }),
+  );
 
   //
   // MAIN LOOP (streaming concurrency approach)
   //
   while (true) {
     // A) If the queue is empty, wait for at least one item
-    if (queue.length === 0) {
-      await condition(() => queue.length > 0);
+    if (priorityQueue.length === 0) {
+      await condition(() => priorityQueue.length > 0);
       // Once unblocked, we know there's an item now.
     }
 
-    // B) Dequeue a single item (we handle one item per iteration)
-    const workspaceId = queue.shift()!;
-    membership.delete(workspaceId);
+    // B) Sort and dequeue the highest priority item
+    priorityQueue.sort(compareWorkspaceItems);
+    const item = priorityQueue.shift()!;
+    const key = generateKeyFromItem(item);
+    const workspaceId = getWorkspaceIdFromItem(item);
 
-    logger.info("Queue: Dequeued workspace", {
+    logger.info("Queue: Dequeued workspace item", {
       workspaceId,
-      queueSize: queue.length,
+      key,
+      priority: item.priority,
+      period: item.period ?? item.maxPeriod,
+      queueSize: priorityQueue.length,
     });
 
     // C) Acquire a semaphore slot to respect concurrency
@@ -139,42 +267,65 @@ export async function computePropertiesQueueWorkflow(
 
     logger.info("Queue: Acquired semaphore slot", {
       workspaceId,
+      key,
     });
 
     // D) Launch the activity in a background task
-    const task = (async () => {
+    const taskPromise = (async () => {
       try {
-        await computePropertiesContained({ workspaceId, now: Date.now() });
+        const now = Date.now();
+        const newItems = await computePropertiesContainedV2({
+          item,
+          now,
+        });
+
+        if (newItems) {
+          for (const newItem of newItems) {
+            const newKey = generateKeyFromItem(newItem);
+            if (priorityQueue.length < capacity && !membership.has(newKey)) {
+              priorityQueue.push(newItem);
+              membership.add(newKey);
+            }
+          }
+        }
         totalProcessed += 1;
-        logger.info("Queue: Processed workspace", {
-          workspaceId,
+        logger.info("Queue: Processed workspace item", {
+          key,
         });
       } catch (err) {
-        logger.error("Error processing workspace from queue", {
-          workspaceId,
+        logger.error("Error processing workspace item from queue", {
+          key,
           err,
         });
       } finally {
+        membership.delete(key);
+        inFlight.splice(
+          inFlight.findIndex((t) => t.key === key),
+          1,
+        );
         semaphore.release();
       }
     })();
-    inFlight.push(task);
+    inFlight.push({ task: taskPromise, key });
 
     // E) Check if we've processed enough items to continueAsNew
     if (totalProcessed >= maxLoopIterations) {
       // Wait for all in-flight tasks to settle
-      await Promise.allSettled(inFlight);
+      await Promise.allSettled(inFlight.map((t) => t.task));
 
-      // Prepare next run
+      // Prepare next run with the V2 queue state
       const nextParams: ComputePropertiesQueueWorkflowParams = {
-        queueState: queue, // carry forward leftover items
+        queueStateV2: priorityQueue,
       };
       logger.info("Reached maxLoopIterations, continuing as new", {
         totalProcessed,
-        nextParams,
+        nextQueueSize: priorityQueue.length,
       });
 
-      await continueAsNew<typeof computePropertiesQueueWorkflow>(nextParams);
+      const shouldContinueAsNew = params.continueAsNew !== false;
+      if (shouldContinueAsNew) {
+        await continueAsNew<typeof computePropertiesQueueWorkflow>(nextParams);
+      }
     }
   }
 }

@@ -12,18 +12,14 @@ import { v5 as uuidv5, validate as validateUuid } from "uuid";
 import {
   ClickHouseQueryBuilder,
   command,
+  createClickhouseClient,
   getChCompatibleUuid,
   query as chQuery,
 } from "../clickhouse";
 import config from "../config";
 import { HUBSPOT_INTEGRATION } from "../constants";
 import { startHubspotUserIntegrationWorkflow } from "../integrations/hubspot/signalUtils";
-import { getSubscribedSegments } from "../journeys";
-import {
-  getUserJourneyWorkflowId,
-  segmentUpdateSignal,
-  userJourneyWorkflow,
-} from "../journeys/userWorkflow";
+import { getSubscribedSegments, triggerSegmentEntryJourney } from "../journeys";
 import logger from "../logger";
 import { getMeter, withSpan, withSpanSync } from "../openTelemetry";
 import { getContext } from "../temporal/activity";
@@ -31,8 +27,9 @@ import {
   BroadcastSegmentNode,
   ComputedAssignment,
   ComputedPropertyAssignment,
-  ComputedPropertyStep,
+  ComputedPropertyStepEnum,
   ComputedPropertyUpdate,
+  CursorDirectionEnum,
   EmailSegmentNode,
   GroupChildrenUserPropertyDefinitions,
   GroupUserPropertyDefinition,
@@ -47,11 +44,11 @@ import {
   SavedIntegrationResource,
   SavedSegmentResource,
   SavedUserPropertyResource,
+  SegmentDefinition,
   SegmentHasBeenOperatorComparator,
   SegmentNode,
   SegmentNodeType,
   SegmentOperatorType,
-  SegmentUpdate,
   SubscriptionChange,
   SubscriptionGroupSegmentNode,
   SubscriptionGroupType,
@@ -62,6 +59,7 @@ import { insertProcessedComputedProperties } from "../userEvents/clickhouse";
 import {
   createPeriods,
   getPeriodsByComputedPropertyId,
+  Period,
   PeriodByComputedPropertyId,
 } from "./periods";
 
@@ -72,6 +70,34 @@ let READ_LIMIT: AsyncWrapper | null = null;
 function identityWrapper<T>(fn: () => Promise<T>): Promise<T> {
   return fn();
 }
+
+function toJsonPathParamCh({
+  path,
+  qb,
+}: {
+  path: string;
+  qb: ClickHouseQueryBuilder;
+}): string | null {
+  const normalizedPath = toJsonPathParam({ path });
+  if (normalizedPath.isErr()) {
+    logger().info(
+      {
+        path,
+        err: normalizedPath.error,
+      },
+      "invalid json path in node path",
+    );
+    return null;
+  }
+
+  return qb.addQueryValue(normalizedPath.value, "String");
+}
+
+// A set of state ids for user property or segment nodes that should not be recomputed
+export type PrunedComputedProperties = {
+  segments: Set<string>;
+  userProperties: Set<string>;
+};
 
 function readLimit(): AsyncWrapper {
   if (!READ_LIMIT) {
@@ -97,6 +123,27 @@ function getEventTimeInterval(windowSeconds: number): number {
   // Window data within 1 / 10th of the specified period, with a minumum
   // window of 30 seconds, and a maximum window of 1 day.
   return Math.min(Math.max(Math.floor(windowSeconds / 10), 1), 86400);
+}
+
+function shouldResetComputedProperty({
+  definitionUpdatedAt,
+  createdAt,
+  now,
+  periodBound,
+}: {
+  definitionUpdatedAt: number;
+  createdAt: number;
+  now: number;
+  periodBound?: number;
+}): boolean {
+  if (!definitionUpdatedAt) {
+    return false;
+  }
+  return (
+    definitionUpdatedAt <= now &&
+    definitionUpdatedAt >= (periodBound ?? 0) &&
+    definitionUpdatedAt > createdAt
+  );
 }
 
 export function userPropertyStateId(
@@ -274,57 +321,6 @@ function subscriptionChangeToPerformed(
   };
 }
 
-async function signalJourney({
-  segmentId,
-  workspaceId,
-  segmentAssignment,
-  journey,
-}: {
-  segmentId: string;
-  workspaceId: string;
-  segmentAssignment: ComputedAssignment;
-  journey: HasStartedJourneyResource;
-}) {
-  const segmentUpdate: SegmentUpdate = {
-    segmentId,
-    currentlyInSegment: Boolean(segmentAssignment.latest_segment_value),
-    segmentVersion: new Date(segmentAssignment.max_assigned_at).getTime(),
-    type: "segment",
-  };
-
-  if (!segmentUpdate.currentlyInSegment) {
-    return;
-  }
-
-  const { workflowClient } = getContext();
-  const { id: journeyId, definition } = journey;
-
-  const workflowId = getUserJourneyWorkflowId({
-    journeyId,
-    userId: segmentAssignment.user_id,
-  });
-
-  const userId = segmentAssignment.user_id;
-
-  await workflowClient.signalWithStart<
-    typeof userJourneyWorkflow,
-    [SegmentUpdate]
-  >(userJourneyWorkflow, {
-    taskQueue: "default",
-    workflowId,
-    args: [
-      {
-        journeyId,
-        definition,
-        workspaceId,
-        userId,
-      },
-    ],
-    signal: segmentUpdateSignal,
-    signalArgs: [segmentUpdate],
-  });
-}
-
 interface FullSubQueryData {
   condition: string;
   type: "user_property" | "segment";
@@ -340,6 +336,32 @@ interface FullSubQueryData {
 }
 type SubQueryData = Omit<FullSubQueryData, "version">;
 
+function getSegmentNodeVersion(
+  segment: SavedSegmentResource,
+  nodeId: string,
+): number | null {
+  const { definition } = segment;
+  if (!definition) {
+    return null;
+  }
+  const nodes: SegmentNode[] = [
+    definition.entryNode,
+    ...(definition.nodes ?? []),
+  ];
+  const node = nodes.find((n) => n.id === nodeId);
+  if (!node) {
+    return null;
+  }
+  if (
+    node.type === SegmentNodeType.Trait &&
+    node.operator?.type === SegmentOperatorType.NotExists
+  ) {
+    // Version 1 for Trait + NotExists semantics fix
+    return 1;
+  }
+  return null;
+}
+
 export function segmentNodeStateId(
   segment: SavedSegmentResource,
   nodeId: string,
@@ -353,10 +375,10 @@ export function segmentNodeStateId(
     );
     return null;
   }
-  return uuidv5(
-    `${segment.definitionUpdatedAt.toString()}:${nodeId}`,
-    segment.id,
-  );
+  const nodeVersion = getSegmentNodeVersion(segment, nodeId);
+  const versionSuffix = nodeVersion !== null ? `:v${nodeVersion}` : "";
+  const name = `${segment.definitionUpdatedAt.toString()}:${nodeId}${versionSuffix}`;
+  return uuidv5(name, segment.id);
 }
 
 function segmentToIndexed({
@@ -374,6 +396,7 @@ function segmentToIndexed({
       }
 
       switch (node.operator.type) {
+        case SegmentOperatorType.AbsoluteTimestamp:
         case SegmentOperatorType.Within: {
           return [
             {
@@ -475,7 +498,7 @@ function buildRecentUpdateSegmentQuery({
       ${expression},
       max(event_time),
       toDateTime64(${nowSeconds}, 3) as assigned_at
-    from computed_property_state_v2 as cps
+    from computed_property_state_v3 as cps
     where
       (
         workspace_id,
@@ -514,6 +537,7 @@ function segmentToResolvedState({
   qb,
   periodBound,
   idUserProperty,
+  prunedComputedProperties,
 }: {
   workspaceId: string;
   segment: SavedSegmentResource;
@@ -522,10 +546,14 @@ function segmentToResolvedState({
   periodBound?: number;
   qb: ClickHouseQueryBuilder;
   idUserProperty?: SavedUserPropertyResource;
+  prunedComputedProperties: PrunedComputedProperties;
 }): string[] {
   const nowSeconds = now / 1000;
   const stateId = segmentNodeStateId(segment, node.id);
   if (!stateId) {
+    return [];
+  }
+  if (prunedComputedProperties.segments.has(stateId)) {
     return [];
   }
   switch (node.type) {
@@ -614,6 +642,7 @@ function segmentToResolvedState({
         return [];
       }
 
+      // TODO: support absolute timestamp
       if (node.withinSeconds && node.withinSeconds > 0) {
         const withinRangeWhereClause = `
           cps_performed.workspace_id = ${workspaceIdParam}
@@ -655,7 +684,7 @@ function segmentToResolvedState({
                 state_id,
                 user_id,
                 uniqMerge(cps_performed.unique_count) ${mappedOperator} ${mappedTimes} as segment_state_value
-              from computed_property_state_v2 cps_performed
+              from computed_property_state_v3 cps_performed
               where
                 ${withinRangeWhereClause}
               group by
@@ -685,7 +714,7 @@ function segmentToResolvedState({
               user_id,
               argMaxMerge(last_value) last_id,
               max(cps.event_time) as max_event_time
-            from computed_property_state_v2 cps
+            from computed_property_state_v3 cps
             where
               cps.workspace_id = ${workspaceIdParam}
               and cps.type = 'user_property'
@@ -702,7 +731,7 @@ function segmentToResolvedState({
                     state_id,
                     user_id,
                     uniqMerge(cps_performed.unique_count) ${mappedOperator} ${mappedTimes} as segment_state_value
-                  from computed_property_state_v2 as cps_performed
+                  from computed_property_state_v3 as cps_performed
                   where
                     ${withinRangeWhereClause}
                   group by
@@ -774,7 +803,7 @@ function segmentToResolvedState({
               state_id,
               user_id,
               uniqMerge(cps_performed.unique_count) ${mappedOperator} ${mappedTimes} as segment_state_value
-            from computed_property_state_v2 cps_performed
+            from computed_property_state_v3 cps_performed
             where
               cps_performed.workspace_id = ${workspaceIdParam}
               and cps_performed.type = 'segment'
@@ -806,7 +835,7 @@ function segmentToResolvedState({
             user_id,
             argMaxMerge(last_value) last_id,
             max(cps.event_time) as max_event_time
-          from computed_property_state_v2 cps
+          from computed_property_state_v3 cps
           where
             cps.workspace_id = ${workspaceIdParam}
             and cps.type = 'user_property'
@@ -823,7 +852,7 @@ function segmentToResolvedState({
                   state_id,
                   user_id,
                   uniqMerge(cps_performed.unique_count) ${mappedOperator} ${mappedTimes} as segment_state_value
-                from computed_property_state_v2 as cps_performed
+                from computed_property_state_v3 as cps_performed
                 where
                   cps_performed.workspace_id = ${workspaceIdParam}
                   and cps_performed.type = 'segment'
@@ -870,10 +899,25 @@ function segmentToResolvedState({
     case SegmentNodeType.Trait: {
       const { operator } = node;
       switch (operator.type) {
+        case SegmentOperatorType.AbsoluteTimestamp:
         case SegmentOperatorType.Within: {
-          const withinLowerBound = Math.round(
-            Math.max(nowSeconds - operator.windowSeconds, 0),
-          );
+          let boundClause: string;
+          if (operator.type === SegmentOperatorType.AbsoluteTimestamp) {
+            const indexValueComparator =
+              operator.direction === CursorDirectionEnum.After ? ">=" : "<";
+            const unixTimestamp = Math.floor(
+              new Date(operator.absoluteTimestamp).getTime() / 1000,
+            );
+            boundClause = `indexed_value ${indexValueComparator} ${qb.addQueryValue(
+              unixTimestamp,
+              "Int32",
+            )}`;
+          } else {
+            const withinLowerBound = Math.round(
+              Math.max(nowSeconds - operator.windowSeconds, 0),
+            );
+            boundClause = `indexed_value >= ${qb.addQueryValue(withinLowerBound, "Int32")}`;
+          }
           const workspaceIdParam = qb.addQueryValue(workspaceId, "String");
           const computedPropertyIdParam = qb.addQueryValue(
             segment.id,
@@ -911,7 +955,7 @@ function segmentToResolvedState({
                   cpsi.computed_property_id,
                   cpsi.state_id,
                   cpsi.user_id,
-                  indexed_value >= ${qb.addQueryValue(withinLowerBound, "Int32")} as segment_state_value
+                  ${boundClause} as segment_state_value
                 from computed_property_state_index cpsi
                 where
                   segment_state_value = True
@@ -936,7 +980,7 @@ function segmentToResolvedState({
               toDateTime64(${nowSeconds}, 3) as assigned_at
             from computed_property_state_index cpsi
             where
-              indexed_value >= ${qb.addQueryValue(withinLowerBound, "Int32")}
+              ${boundClause}
               and cpsi.workspace_id = ${workspaceIdParam}
               and cpsi.type = 'segment'
               and cpsi.computed_property_id = ${computedPropertyIdParam}
@@ -990,7 +1034,7 @@ function segmentToResolvedState({
               False,
               max(cps.event_time),
               toDateTime64(${nowSeconds}, 3) as assigned_at
-            from computed_property_state_v2 as cps
+            from computed_property_state_v3 as cps
             where
               cps.workspace_id = ${workspaceIdParam}
               and cps.type = 'segment'
@@ -1044,7 +1088,7 @@ function segmentToResolvedState({
               False,
               max(cps.event_time),
               toDateTime64(${nowSeconds}, 3) as assigned_at
-            from computed_property_state_v2 as cps
+            from computed_property_state_v3 as cps
             where
               cps.workspace_id = ${workspaceIdParam}
               and cps.type = 'segment'
@@ -1089,7 +1133,7 @@ function segmentToResolvedState({
               True,
               max(cps.event_time),
               toDateTime64(${nowSeconds}, 3) as assigned_at
-            from computed_property_state_v2 as cps
+            from computed_property_state_v3 as cps
             where
               cps.workspace_id = ${workspaceIdParam}
               and cps.type = 'segment'
@@ -1203,13 +1247,17 @@ function segmentToResolvedState({
             buildRecentUpdateSegmentQuery({
               workspaceId,
               stateId,
-              // We use the stateId as a placeholder string to allow NotExists to
-              // select empty values. No real danger of collisions given that
-              // stateId is a uuid.
-              expression: `argMaxMerge(last_value) == ${qb.addQueryValue(
+              // NotExists should be true if the trait has never had a
+              // non-empty value. We encode empties vs non-empties in
+              // uniqValue and then detect the "only empties" case via the
+              // combination of uniqMerge(unique_count) and argMaxMerge(last_value).
+              //
+              // uniqMerge(unique_count) == 1 and last_value == stateId
+              // => we have only seen empty/missing values for this trait.
+              expression: `(uniqMerge(unique_count) == 1 and argMaxMerge(last_value) == ${qb.addQueryValue(
                 stateId,
                 "String",
-              )}`,
+              )})`,
               segmentId: segment.id,
               now,
               periodBound,
@@ -1244,6 +1292,7 @@ function segmentToResolvedState({
           periodBound,
           workspaceId,
           idUserProperty,
+          prunedComputedProperties,
           qb,
         });
       });
@@ -1269,6 +1318,7 @@ function segmentToResolvedState({
           periodBound,
           workspaceId,
           idUserProperty,
+          prunedComputedProperties,
           qb,
         });
       });
@@ -1286,6 +1336,7 @@ function segmentToResolvedState({
         periodBound,
         workspaceId,
         idUserProperty,
+        prunedComputedProperties,
         qb,
       });
     }
@@ -1298,6 +1349,7 @@ function segmentToResolvedState({
         periodBound,
         workspaceId,
         idUserProperty,
+        prunedComputedProperties,
         qb,
       });
     }
@@ -1378,6 +1430,7 @@ function segmentToResolvedState({
         periodBound,
         workspaceId,
         idUserProperty,
+        prunedComputedProperties,
         qb,
       });
     }
@@ -1393,9 +1446,14 @@ function segmentToResolvedState({
         : null;
 
       if (!userIdStateParam || !userIdPropertyIdParam) {
-        throw new Error(
+        logger().error(
+          {
+            segment,
+            node,
+          },
           "User ID state and property ID are required for random bucket segments",
         );
+        return [];
       }
       const stateIdParam = qb.addQueryValue(stateId, "String");
       const segmentIdParam = qb.addQueryValue(segment.id, "String");
@@ -1412,7 +1470,7 @@ function segmentToResolvedState({
           reinterpretAsUInt64(reverse(unhex(left(hex(MD5(concat(user_id, ${segmentNameParam}))), 16)))) < (${qb.addQueryValue(node.percent, "Float64")} * pow(2, 64)),
           max(event_time),
           toDateTime64(${nowSeconds}, 3) as assigned_at
-        from computed_property_state_v2 as cps
+        from computed_property_state_v3 as cps
         where
           (
             workspace_id,
@@ -1447,6 +1505,28 @@ function segmentToResolvedState({
           workspaceId,
           stateId,
           expression: `True`,
+          segmentId: segment.id,
+          now,
+          periodBound,
+          qb,
+        }),
+      ];
+    }
+    case SegmentNodeType.Includes: {
+      const arrayPath = toJsonPathParamCh({
+        path: node.path,
+        qb,
+      });
+      if (!arrayPath) {
+        return [];
+      }
+      const itemParam = qb.addQueryValue(node.item, "String");
+      const expression = `if(argMaxMerge(last_value) != '', has(JSONExtract(argMaxMerge(last_value), 'Array(String)'), ${itemParam}), False)`;
+      return [
+        buildRecentUpdateSegmentQuery({
+          workspaceId,
+          stateId,
+          expression,
           segmentId: segment.id,
           now,
           periodBound,
@@ -1528,7 +1608,7 @@ function resolvedSegmentToAssignment({
       }
       return {
         stateIds: children.flatMap((c) => c.stateIds),
-        expression: `(${children.map((c) => c.expression).join(" and ")})`,
+        expression: `(${children.flatMap((c) => c.expression).join(" and ")})`,
       };
     }
     case SegmentNodeType.Or: {
@@ -1561,9 +1641,10 @@ function resolvedSegmentToAssignment({
       if (children.length === 1 && child) {
         return child;
       }
+      const stateIds = children.flatMap((c) => c?.stateIds ?? []);
       return {
-        stateIds: children.flatMap((c) => c.stateIds),
-        expression: `(${children.map((c) => c.expression).join(" or ")})`,
+        stateIds,
+        expression: `(${children.flatMap((c) => c?.expression ?? []).join(" or ")})`,
       };
     }
     case SegmentNodeType.Broadcast: {
@@ -1617,31 +1698,15 @@ function resolvedSegmentToAssignment({
         expression: "True",
       };
     }
+    case SegmentNodeType.Includes: {
+      return {
+        stateIds: [stateId],
+        expression: stateValue,
+      };
+    }
     default:
       assertUnreachable(node);
   }
-}
-
-function toJsonPathParamCh({
-  path,
-  qb,
-}: {
-  path: string;
-  qb: ClickHouseQueryBuilder;
-}): string | null {
-  const normalizedPath = toJsonPathParam({ path });
-  if (normalizedPath.isErr()) {
-    logger().info(
-      {
-        path,
-        err: normalizedPath.error,
-      },
-      "invalid json path in node path",
-    );
-    return null;
-  }
-
-  return qb.addQueryValue(normalizedPath.value, "String");
 }
 
 function truncateEventTimeExpression(windowSeconds: number): string {
@@ -1671,17 +1736,14 @@ export function segmentNodeToStateSubQuery({
       if (!path) {
         return [];
       }
-      if (
-        node.operator.type === SegmentOperatorType.NotEquals ||
-        node.operator.type === SegmentOperatorType.NotExists
-      ) {
+      if (node.operator.type === SegmentOperatorType.NotEquals) {
         const varName = qb.getVariableName();
         return [
           {
             condition: `event_type == 'identify'`,
             type: "segment",
             uniqValue: "''",
-            // using stateId as placeholder string to allow NotEquals and NotExists
+            // using stateId as placeholder string to allow NotEquals
             // to select empty values. no real danger of collissions given that
             // stateId is a uuid
             argMaxValue: `
@@ -1696,11 +1758,49 @@ export function segmentNodeToStateSubQuery({
           },
         ];
       }
-      const eventTimeExpression: string | undefined =
+      if (node.operator.type === SegmentOperatorType.NotExists) {
+        const varName = qb.getVariableName();
+        return [
+          {
+            condition: `event_type == 'identify'`,
+            type: "segment",
+            // mark empties vs non-empties so we can later distinguish
+            // "only empties" from "has at least one non-empty" using
+            // uniqMerge(unique_count) together with argMaxMerge(last_value)
+            uniqValue: `
+              if(
+                JSON_VALUE(properties, ${path}) == '',
+                'E',
+                'N'
+              )
+            `,
+            // using stateId as placeholder string to allow NotExists
+            // to select empty values. no real danger of collissions given that
+            // stateId is a uuid
+            argMaxValue: `
+              if(
+                (JSON_VALUE(properties, ${path}) as ${varName}) == '',
+                ${qb.addQueryValue(stateId, "String")},
+                ${varName}
+              )
+            `,
+            computedPropertyId: segment.id,
+            stateId,
+          },
+        ];
+      }
+      let eventTimeExpression: string | undefined;
+      if (
         node.operator.type === SegmentOperatorType.HasBeen ||
         node.operator.type === SegmentOperatorType.Within
-          ? truncateEventTimeExpression(node.operator.windowSeconds)
-          : undefined;
+      ) {
+        eventTimeExpression = truncateEventTimeExpression(
+          node.operator.windowSeconds,
+        );
+      } else if (node.operator.type === SegmentOperatorType.AbsoluteTimestamp) {
+        // Using precision / interval of 1 hour
+        eventTimeExpression = `toDateTime64(toStartOfInterval(event_time, toIntervalSecond(3600)), 3)`;
+      }
 
       return [
         {
@@ -1774,11 +1874,15 @@ export function segmentNodeToStateSubQuery({
               `Unimplemented segment operator for performed node ${operator.type} for segment: ${segment.id} and node: ${node.id}`,
             );
           }
+          case SegmentOperatorType.AbsoluteTimestamp: {
+            throw new Error("Not implemented");
+          }
           default:
             assertUnreachable(operator);
             return [];
         }
       });
+      // TODO: support absolute timestamp
       const eventTimeExpression: string | undefined = node.withinSeconds
         ? truncateEventTimeExpression(node.withinSeconds)
         : undefined;
@@ -1983,6 +2087,29 @@ export function segmentNodeToStateSubQuery({
           condition: "True",
           type: "segment",
           uniqValue: "'0'",
+          computedPropertyId: segment.id,
+          stateId,
+        },
+      ];
+    }
+    case SegmentNodeType.Includes: {
+      const stateId = segmentNodeStateId(segment, node.id);
+      if (!stateId) {
+        return [];
+      }
+      const arrayPath = toJsonPathParamCh({
+        path: node.path,
+        qb,
+      });
+      if (!arrayPath) {
+        return [];
+      }
+      // For identify events, compute the state as the entire array at node.path
+      return [
+        {
+          condition: `event_type == 'identify'`,
+          type: "segment",
+          argMaxValue: `JSON_VALUE(properties, ${arrayPath})`,
           computedPropertyId: segment.id,
           stateId,
         },
@@ -2404,7 +2531,7 @@ function assignStandardUserPropertiesQuery({
           argMaxMerge(last_value) last_value,
           uniqMerge(unique_count) unique_count,
           max(event_time) max_event_time
-        from computed_property_state_v2 cps
+        from computed_property_state_v3 cps
         where
           (
             workspace_id,
@@ -2413,12 +2540,14 @@ function assignStandardUserPropertiesQuery({
             state_id,
             user_id
           ) in (${boundedQuery})
+
         group by
           workspace_id,
           type,
           computed_property_id,
           state_id,
           user_id
+
       )
       group by
         workspace_id,
@@ -2506,7 +2635,7 @@ function assignPerformedManyUserPropertiesQuery({
         SELECT
             arrayJoin(groupArrayMerge(cps.grouped_message_ids)) AS message_ids
         FROM
-            computed_property_state_v2 AS cps
+            computed_property_state_v3 AS cps
         WHERE
             (
                 workspace_id,
@@ -2811,12 +2940,15 @@ export interface ComputePropertiesArgs {
 export type PartialComputePropertiesArgs = Omit<
   ComputePropertiesArgs,
   "journeys" | "integrations"
->;
+> & {
+  prunedComputedProperties: PrunedComputedProperties;
+};
 
 export async function computeState({
   workspaceId,
   segments,
   userProperties,
+  prunedComputedProperties,
   now,
 }: PartialComputePropertiesArgs) {
   return withSpan({ name: "compute-state" }, async (span) => {
@@ -2836,10 +2968,15 @@ export async function computeState({
             segment,
             node: segment.definition.entryNode,
             qb,
-          }).map((subQuery) => ({
-            ...subQuery,
-            version: segment.definitionUpdatedAt.toString(),
-          }));
+          }).flatMap((subQuery) => {
+            if (prunedComputedProperties.segments.has(subQuery.stateId)) {
+              return [];
+            }
+            return {
+              ...subQuery,
+              version: segment.definitionUpdatedAt.toString(),
+            };
+          });
         },
       );
       subQueryData = subQueryData.concat(newSubQueryData);
@@ -2855,10 +2992,15 @@ export async function computeState({
           return userPropertyToSubQuery({
             userProperty,
             qb,
-          }).map((subQuery) => ({
-            ...subQuery,
-            version: userProperty.definitionUpdatedAt.toString(),
-          }));
+          }).flatMap((subQuery) => {
+            if (prunedComputedProperties.userProperties.has(subQuery.stateId)) {
+              return [];
+            }
+            return {
+              ...subQuery,
+              version: userProperty.definitionUpdatedAt.toString(),
+            };
+          });
         },
       );
       subQueryData = subQueryData.concat(newSubQueryData);
@@ -2869,7 +3011,7 @@ export async function computeState({
 
     const periodByComputedPropertyId = await getPeriodsByComputedPropertyId({
       workspaceId,
-      step: ComputedPropertyStep.ComputeState,
+      step: ComputedPropertyStepEnum.ComputeState,
     });
 
     const subQueriesWithPeriods = subQueryData.reduce<
@@ -2884,6 +3026,9 @@ export async function computeState({
 
     const nowSeconds = now / 1000;
     const workspaceIdClause = qb.addQueryValue(workspaceId, "String");
+    const clickhouseClient = createClickhouseClient({
+      requestTimeout: config().clickhouseComputePropertiesRequestTimeout,
+    });
 
     const queries = Array.from(subQueriesWithPeriods.entries()).flatMap(
       ([period, periodSubQueries]) => {
@@ -2903,7 +3048,7 @@ export async function computeState({
               SELECT
                 user_id,
                 argMaxMerge(last_value) as last_value
-              FROM computed_property_state_v2
+              FROM computed_property_state_v3
               WHERE
                 workspace_id = ${workspaceIdClause}
                 AND type = '${subQuery.type}'
@@ -2915,7 +3060,7 @@ export async function computeState({
           `;
 
           const query = `
-            insert into computed_property_state_v2
+            insert into computed_property_state_v3
             select
               ue.workspace_id,
               '${subQuery.type}' as type,
@@ -2944,15 +3089,21 @@ export async function computeState({
               ue.event_time
           `;
 
-          await command({
-            query,
-            query_params: qb.getQueries(),
-            clickhouse_settings: {
-              wait_end_of_query: 1,
-              function_json_value_return_type_allow_complex: 1,
-              max_execution_time: 15000,
+          await command(
+            {
+              query,
+              query_params: qb.getQueries(),
+              clickhouse_settings: {
+                wait_end_of_query: 1,
+                function_json_value_return_type_allow_complex: 1,
+                max_execution_time:
+                  config().clickhouseComputePropertiesMaxExecutionTime,
+              },
             },
-          });
+            {
+              clickhouseClient,
+            },
+          );
         });
       },
     );
@@ -2964,39 +3115,79 @@ export async function computeState({
       segments,
       now,
       periodByComputedPropertyId,
-      step: ComputedPropertyStep.ComputeState,
+      step: ComputedPropertyStepEnum.ComputeState,
     });
   });
 }
 
+interface AssignmentQuery {
+  query: string;
+  computedPropertyId: string;
+  computedPropertyType: "segment" | "user_property";
+}
+
 interface AssignmentQueryGroup {
-  queries: (string | string[])[];
+  queries: (AssignmentQuery | AssignmentQuery[])[];
   qb: ClickHouseQueryBuilder;
 }
 
-async function execAssignmentQueryGroup({ queries, qb }: AssignmentQueryGroup) {
-  for (const query of queries) {
-    if (Array.isArray(query)) {
+async function execAssignmentQueryGroup({
+  workspaceId,
+  group,
+  clickhouseClient,
+}: {
+  workspaceId: string;
+  group: AssignmentQueryGroup;
+  clickhouseClient: ReturnType<typeof createClickhouseClient>;
+}) {
+  const { queries, qb } = group;
+  for (const assignmentQuery of queries) {
+    if (Array.isArray(assignmentQuery)) {
       await Promise.all(
-        query.map((q) =>
-          command({
-            query: q,
-            query_params: qb.getQueries(),
-            clickhouse_settings: {
-              wait_end_of_query: 1,
-              max_execution_time: 15000,
-            },
-          }),
+        assignmentQuery.map(
+          ({ query, computedPropertyId, computedPropertyType }) =>
+            withSpan({ name: "exec-assignment-query" }, async (span) => {
+              span.setAttribute("workspaceId", workspaceId);
+              span.setAttribute("computedPropertyId", computedPropertyId);
+              span.setAttribute("computedPropertyType", computedPropertyType);
+              return command(
+                {
+                  query,
+                  query_params: qb.getQueries(),
+                  clickhouse_settings: {
+                    wait_end_of_query: 1,
+                    max_execution_time:
+                      config().clickhouseComputePropertiesMaxExecutionTime,
+                  },
+                },
+                { clickhouseClient },
+              );
+            }),
         ),
       );
     } else {
-      await command({
-        query,
-        query_params: qb.getQueries(),
-        clickhouse_settings: {
-          wait_end_of_query: 1,
-          max_execution_time: 15000,
-        },
+      await withSpan({ name: "exec-assignment-query" }, async (span) => {
+        span.setAttribute("workspaceId", workspaceId);
+        span.setAttribute(
+          "computedPropertyId",
+          assignmentQuery.computedPropertyId,
+        );
+        span.setAttribute(
+          "computedPropertyType",
+          assignmentQuery.computedPropertyType,
+        );
+        return command(
+          {
+            query: assignmentQuery.query,
+            query_params: qb.getQueries(),
+            clickhouse_settings: {
+              wait_end_of_query: 1,
+              max_execution_time:
+                config().clickhouseComputePropertiesMaxExecutionTime,
+            },
+          },
+          { clickhouseClient },
+        );
       });
     }
   }
@@ -3006,6 +3197,7 @@ export async function computeAssignments({
   workspaceId,
   segments,
   userProperties,
+  prunedComputedProperties,
   now,
 }: PartialComputePropertiesArgs): Promise<void> {
   return withSpan({ name: "compute-assignments" }, async (span) => {
@@ -3013,7 +3205,7 @@ export async function computeAssignments({
 
     const periodByComputedPropertyId = await getPeriodsByComputedPropertyId({
       workspaceId,
-      step: ComputedPropertyStep.ComputeAssignments,
+      step: ComputedPropertyStepEnum.ComputeAssignments,
     });
     const segmentQueries: AssignmentQueryGroup[] = [];
     const userPropertyQueries: AssignmentQueryGroup[] = [];
@@ -3021,8 +3213,12 @@ export async function computeAssignments({
     const idUserProperty = userProperties.find(
       (up) => up.definition.type === UserPropertyDefinitionType.Id,
     );
+    const clickhouseClient = createClickhouseClient({
+      requestTimeout: config().clickhouseComputePropertiesRequestTimeout,
+    });
 
     for (const segment of segments) {
+      // eslint-disable-next-line @typescript-eslint/no-loop-func
       withSpanSync({ name: "compute-segment-assignments" }, (spanS) => {
         spanS.setAttribute("workspaceId", workspaceId);
         spanS.setAttribute("segmentId", segment.id);
@@ -3051,109 +3247,117 @@ export async function computeAssignments({
           qb,
           periodBound,
           idUserProperty,
+          prunedComputedProperties,
         });
+        if (resolvedQueries.length === 0) {
+          return;
+        }
+        const assignmentQueries: string[] = [];
         const assignmentConfig = resolvedSegmentToAssignment({
           segment,
           node: segment.definition.entryNode,
           qb,
         });
-        const workspaceIdParam = qb.addQueryValue(workspaceId, "String");
-
-        const segmentIdParam = qb.addQueryValue(segment.id, "String");
-        const stateIdsParam = qb.addQueryValue(
-          assignmentConfig.stateIds,
-          "Array(String)",
+        const allStateIdsPruned = assignmentConfig.stateIds.every((id) =>
+          prunedComputedProperties.segments.has(id),
         );
-        const assignmentQueries = [
-          `
-        insert into computed_property_assignments_v2
-        select
-          workspace_id,
-          'segment',
-          segment_id,
-          user_id,
-          ${assignmentConfig.expression} as segment_value,
-          '',
-          max_state_event_time,
-          toDateTime64(${nowSeconds}, 3) as assigned_at
-        from (
-          select
-            workspace_id,
-            segment_id,
-            user_id,
-            CAST((groupArray(state_id), groupArray(segment_state_value)), 'Map(String, Boolean)') as state_values,
-            max(max_state_event_time) as max_state_event_time
-          from  (
+
+        const workspaceIdParam = qb.addQueryValue(workspaceId, "String");
+        const segmentIdParam = qb.addQueryValue(segment.id, "String");
+        const shouldReset = shouldResetComputedProperty({
+          definitionUpdatedAt: segment.definitionUpdatedAt,
+          createdAt: segment.createdAt,
+          now,
+          periodBound,
+        });
+
+        if (!allStateIdsPruned || shouldReset) {
+          const stateIdsParam = qb.addQueryValue(
+            assignmentConfig.stateIds,
+            "Array(String)",
+          );
+          assignmentQueries.push(
+            `insert into computed_property_assignments_v2
             select
               workspace_id,
+              'segment',
               segment_id,
-              state_id,
               user_id,
-              argMax(segment_state_value, computed_at) segment_state_value,
-              max(max_event_time) as max_state_event_time
-            from resolved_segment_state
-            where
-              (
+              ${assignmentConfig.expression} as segment_value,
+              '',
+              max_state_event_time,
+              toDateTime64(${nowSeconds}, 3) as assigned_at
+            from (
+              select
                 workspace_id,
                 segment_id,
-                user_id
-              ) in (
+                user_id,
+                CAST((groupArray(state_id), groupArray(segment_state_value)), 'Map(String, Boolean)') as state_values,
+                max(max_state_event_time) as max_state_event_time
+              from  (
                 select
                   workspace_id,
                   segment_id,
-                  user_id
+                  state_id,
+                  user_id,
+                  argMax(segment_state_value, computed_at) segment_state_value,
+                  max(max_event_time) as max_state_event_time
                 from resolved_segment_state
                 where
-                  workspace_id = ${workspaceIdParam}
-                  and segment_id = ${segmentIdParam}
-                  and computed_at <= toDateTime64(${nowSeconds}, 3)
-                  and state_id in ${stateIdsParam}
-                  ${lowerBoundClause}
+                  (
+                    workspace_id,
+                    segment_id,
+                    user_id
+                  ) in (
+                    select
+                      workspace_id,
+                      segment_id,
+                      user_id
+                    from resolved_segment_state
+                    where
+                      workspace_id = ${workspaceIdParam}
+                      and segment_id = ${segmentIdParam}
+                      and computed_at <= toDateTime64(${nowSeconds}, 3)
+                      and state_id in ${stateIdsParam}
+                      ${lowerBoundClause}
+                  )
+                group by
+                  workspace_id,
+                  segment_id,
+                  user_id,
+                  state_id
               )
-            group by
-              workspace_id,
-              segment_id,
-              user_id,
-              state_id
-          )
-          group by
-            workspace_id,
-            segment_id,
-            user_id
-        )
-      `,
-        ];
+              group by
+                workspace_id,
+                segment_id,
+                user_id
+            )`,
+          );
 
-        if (
-          segment.definitionUpdatedAt &&
-          segment.definitionUpdatedAt <= now &&
-          segment.definitionUpdatedAt >= (periodBound ?? 0) &&
-          segment.definitionUpdatedAt > segment.createdAt
-        ) {
-          const resetQuery = `
-          insert into computed_property_assignments_v2
-          select
-            workspace_id,
-            'segment',
-            computed_property_id,
-            user_id,
-            False as segment_value,
-            '',
-            max_event_time,
-            toDateTime64(${nowSeconds}, 3)
-          from computed_property_assignments_v2
+          if (shouldReset) {
+            logger().debug(
+              {
+                segment,
+                workspaceId,
+              },
+              "resetting segment assignments",
+            );
+            const resetQuery = `
+          delete from computed_property_assignments_v2
           where
             workspace_id = ${workspaceIdParam}
             and type = 'segment'
             and computed_property_id = ${segmentIdParam}
             and assigned_at < toDateTime64(${nowSeconds}, 3)
+          settings mutations_sync = 0, lightweight_deletes_sync = 0;
         `;
 
-          assignmentQueries.unshift(resetQuery);
+            assignmentQueries.unshift(resetQuery);
+          }
         }
 
-        const queries: (string | string[])[] = [
-          resolvedQueries,
+        const queries: (string | string)[] = [
+          ...resolvedQueries,
           ...assignmentQueries,
         ];
 
@@ -3178,7 +3382,7 @@ export async function computeAssignments({
                 .join(",")},
               0
             ) indexed_value
-          from computed_property_state_v2
+          from computed_property_state_v3
           where
             workspace_id = ${workspaceIdParam}
             and type = 'segment'
@@ -3200,7 +3404,11 @@ export async function computeAssignments({
         }
 
         segmentQueries.push({
-          queries,
+          queries: queries.map((query) => ({
+            query,
+            computedPropertyId: segment.id,
+            computedPropertyType: "segment" as const,
+          })),
           qb,
         });
       });
@@ -3221,6 +3429,25 @@ export async function computeAssignments({
           userProperty,
           qb,
         });
+        const allStateIdsPruned =
+          ac !== null &&
+          (ac.type === UserPropertyAssignmentType.Standard
+            ? ac.stateIds
+            : [ac.stateId]
+          ).every((stateId) =>
+            prunedComputedProperties.userProperties.has(stateId),
+          );
+
+        const shouldReset = shouldResetComputedProperty({
+          definitionUpdatedAt: userProperty.definitionUpdatedAt,
+          createdAt: userProperty.createdAt,
+          now,
+          periodBound: period?.maxTo.getTime(),
+        });
+
+        if (allStateIdsPruned && !shouldReset) {
+          return;
+        }
 
         const stateQuery = ac
           ? assignUserPropertiesQuery({
@@ -3234,12 +3461,7 @@ export async function computeAssignments({
           : null;
         const queries: string[] = [];
 
-        if (
-          userProperty.definitionUpdatedAt &&
-          userProperty.definitionUpdatedAt <= now &&
-          userProperty.definitionUpdatedAt >= (period?.maxTo.getTime() ?? 0) &&
-          userProperty.definitionUpdatedAt > userProperty.createdAt
-        ) {
+        if (shouldReset) {
           const nowSeconds = now / 1000;
           const workspaceIdParam = qb.addQueryValue(workspaceId, "String");
           const userPropertyIdParam = qb.addQueryValue(
@@ -3247,22 +3469,13 @@ export async function computeAssignments({
             "String",
           );
           const resetQuery = `
-          insert into computed_property_assignments_v2
-          select
-            workspace_id,
-            'user_property',
-            computed_property_id,
-            user_id,
-            False,
-            '',
-            max_event_time,
-            toDateTime64(${nowSeconds}, 3)
-          from computed_property_assignments_v2
+          delete from computed_property_assignments_v2
           where
             workspace_id = ${workspaceIdParam}
             and type = 'user_property'
             and computed_property_id = ${userPropertyIdParam}
             and assigned_at < toDateTime64(${nowSeconds}, 3)
+          settings mutations_sync = 0, lightweight_deletes_sync = 0;
         `;
           queries.push(resetQuery);
         }
@@ -3281,14 +3494,24 @@ export async function computeAssignments({
           return;
         }
         userPropertyQueries.push({
-          queries,
+          queries: queries.map((query) => ({
+            query,
+            computedPropertyId: userProperty.id,
+            computedPropertyType: "user_property" as const,
+          })),
           qb,
         });
       });
     }
 
     await Promise.all(
-      [...segmentQueries, ...userPropertyQueries].map(execAssignmentQueryGroup),
+      [...segmentQueries, ...userPropertyQueries].map((group) =>
+        execAssignmentQueryGroup({
+          workspaceId,
+          group,
+          clickhouseClient,
+        }),
+      ),
     );
 
     await createPeriods({
@@ -3297,7 +3520,7 @@ export async function computeAssignments({
       segments,
       now,
       periodByComputedPropertyId,
-      step: ComputedPropertyStep.ComputeAssignments,
+      step: ComputedPropertyStepEnum.ComputeAssignments,
     });
   });
 }
@@ -3321,10 +3544,12 @@ async function processRowsInner({
   rows,
   workspaceId,
   subscribedJourneys,
+  segmentDefinitionById,
 }: {
   rows: unknown[];
   workspaceId: string;
   subscribedJourneys: HasStartedJourneyResource[];
+  segmentDefinitionById: Map<string, SegmentDefinition>;
 }): Promise<string | null> {
   logger().trace(
     {
@@ -3365,6 +3590,15 @@ async function processRowsInner({
 
   await Promise.all([
     ...journeySegmentAssignments.flatMap((assignment) => {
+      const segmentId = assignment.computed_property_id;
+      const segmentDefinition = segmentDefinitionById.get(segmentId);
+      if (!segmentDefinition) {
+        logger().error(
+          { workspaceId, segmentId },
+          "Missing segment definition for triggerSegmentEntryJourney",
+        );
+        return [];
+      }
       const journey = subscribedJourneys.find(
         (j) => j.id === assignment.processed_for,
       );
@@ -3379,9 +3613,10 @@ async function processRowsInner({
         return [];
       }
 
-      return signalJourney({
+      return triggerSegmentEntryJourney({
         workspaceId,
-        segmentId: assignment.computed_property_id,
+        segmentId,
+        segmentDefinition,
         segmentAssignment: assignment,
         journey,
       });
@@ -3469,6 +3704,7 @@ interface BaseProcessAssignmentsQueryArgs {
   computedPropertyVersion: string;
   now: number;
   periodByComputedPropertyId: PeriodByComputedPropertyId;
+  processedForUpdatedAt: number;
 }
 
 type SegmentProcessAssignmentsQueryArgs = BaseProcessAssignmentsQueryArgs & {
@@ -3497,6 +3733,7 @@ function buildProcessAssignmentsQuery({
   computedPropertyVersion,
   limit,
   cursor,
+  processedForUpdatedAt,
   ...rest
 }: ProcessAssignmentsQueryArgs & {
   limit: number;
@@ -3529,8 +3766,10 @@ function buildProcessAssignmentsQuery({
     version: computedPropertyVersion,
   });
   const periodBound = period?.maxTo.getTime();
+  // ignore bound if the resource that the user property or segment is processed
+  // for was updated in the last period
   const lowerBoundClause =
-    periodBound && periodBound > 0
+    periodBound && periodBound > 0 && periodBound > processedForUpdatedAt
       ? `and assigned_at >= toDateTime64(${periodBound / 1000}, 3)`
       : "";
   const innerCursorClause = cursor
@@ -3620,6 +3859,7 @@ type AssignmentProcessorParams = (
   | WithoutProcessorParams<UserPropertyProcessAssignmentsQueryArgs>
 ) & {
   journeys: HasStartedJourneyResource[];
+  segmentDefinitionById: Map<string, SegmentDefinition>;
 };
 
 /**
@@ -3653,11 +3893,18 @@ class AssignmentProcessor {
       let retrieved = this.pageSize;
       while (retrieved >= this.pageSize) {
         const qb = new ClickHouseQueryBuilder();
+        const clickhouseClient = createClickhouseClient({
+          requestTimeout: config().clickhouseComputePropertiesRequestTimeout,
+        });
         const currentCursor = cursor;
         const results = await withSpan(
           { name: "process-assignments-query-page" },
           async (pageSpan) => {
-            const { journeys, ...processAssignmentsParams } = this.params;
+            const {
+              journeys,
+              segmentDefinitionById,
+              ...processAssignmentsParams
+            } = this.params;
             const pageQueryId = getChCompatibleUuid();
             queryIds.push(pageQueryId);
 
@@ -3687,22 +3934,27 @@ class AssignmentProcessor {
                 qb,
               });
 
-              const resultSet = await chQuery({
-                query,
-                query_id: pageQueryId,
-                query_params: qb.getQueries(),
-                format: "JSONEachRow",
-                clickhouse_settings: {
-                  wait_end_of_query: 1,
-                  max_execution_time: 15000,
-                  join_algorithm: "grace_hash",
+              const resultSet = await chQuery(
+                {
+                  query,
+                  query_id: pageQueryId,
+                  query_params: qb.getQueries(),
+                  format: "JSONEachRow",
+                  clickhouse_settings: {
+                    wait_end_of_query: 1,
+                    max_execution_time:
+                      config().clickhouseComputePropertiesMaxExecutionTime,
+                    join_algorithm: "grace_hash",
+                  },
                 },
-              });
+                { clickhouseClient },
+              );
               const resultRows = await resultSet.json();
               const nextCursor = await processRows({
                 rows: resultRows,
                 workspaceId: this.params.workspaceId,
                 subscribedJourneys: journeys,
+                segmentDefinitionById,
               });
 
               const pageRetrieved = resultRows.length;
@@ -3818,19 +4070,57 @@ export async function processAssignments({
       return memo;
     }, new Map());
 
+    const journeyMap = journeys.reduce<
+      Map<string, SavedHasStartedJourneyResource>
+    >((memo, j) => {
+      memo.set(j.id, j);
+      return memo;
+    }, new Map());
+
+    // map from integration name to integration
+    const integrationMap = integrations.reduce<
+      Map<string, SavedIntegrationResource>
+    >((memo, i) => {
+      memo.set(i.name, i);
+      return memo;
+    }, new Map());
+
     const periodByComputedPropertyId = await getPeriodsByComputedPropertyId({
       workspaceId,
-      step: ComputedPropertyStep.ProcessAssignments,
+      step: ComputedPropertyStepEnum.ProcessAssignments,
     });
 
     const assignmentProcessors: AssignmentProcessor[] = [];
+    const segmentDefinitionById = new Map<string, SegmentDefinition>();
+    for (const s of segments) {
+      segmentDefinitionById.set(s.id, s.definition);
+    }
 
     for (const [segmentId, journeySet] of Array.from(subscribedJourneyMap)) {
       const segment = segmentById.get(segmentId);
       if (!segment) {
+        logger().error(
+          {
+            workspaceId,
+            segmentId,
+          },
+          "segment not found to process",
+        );
         continue;
       }
       for (const journeyId of Array.from(journeySet)) {
+        const journey = journeyMap.get(journeyId);
+        if (!journey) {
+          logger().error(
+            {
+              workspaceId,
+              journeyId,
+            },
+            "journey not found to process",
+          );
+          continue;
+        }
+
         const processor = new AssignmentProcessor({
           workspaceId,
           type: "segment",
@@ -3839,8 +4129,10 @@ export async function processAssignments({
           processedFor: journeyId,
           periodByComputedPropertyId,
           computedPropertyVersion: segment.definitionUpdatedAt.toString(),
+          processedForUpdatedAt: journey.updatedAt,
           now,
           journeys,
+          segmentDefinitionById,
         });
         assignmentProcessors.push(processor);
       }
@@ -3851,9 +4143,27 @@ export async function processAssignments({
     )) {
       const segment = segmentById.get(segmentId);
       if (!segment) {
+        logger().error(
+          {
+            workspaceId,
+            segmentId,
+          },
+          "segment not found to process",
+        );
         continue;
       }
       for (const integrationName of Array.from(integrationSet)) {
+        const integration = integrationMap.get(integrationName);
+        if (!integration) {
+          logger().error(
+            {
+              workspaceId,
+              integrationName,
+            },
+            "integration not found to process",
+          );
+          continue;
+        }
         const processor = new AssignmentProcessor({
           workspaceId,
           type: "segment",
@@ -3863,7 +4173,9 @@ export async function processAssignments({
           periodByComputedPropertyId,
           computedPropertyVersion: segment.definitionUpdatedAt.toString(),
           now,
+          processedForUpdatedAt: integration.updatedAt,
           journeys,
+          segmentDefinitionById,
         });
         assignmentProcessors.push(processor);
       }
@@ -3877,6 +4189,17 @@ export async function processAssignments({
         continue;
       }
       for (const integrationName of Array.from(integrationSet)) {
+        const integration = integrationMap.get(integrationName);
+        if (!integration) {
+          logger().error(
+            {
+              workspaceId,
+              integrationName,
+            },
+            "integration not found to process",
+          );
+          continue;
+        }
         const processor = new AssignmentProcessor({
           workspaceId,
           type: "user_property",
@@ -3886,7 +4209,9 @@ export async function processAssignments({
           periodByComputedPropertyId,
           computedPropertyVersion: userProperty.definitionUpdatedAt.toString(),
           now,
+          processedForUpdatedAt: integration.updatedAt,
           journeys,
+          segmentDefinitionById,
         });
         assignmentProcessors.push(processor);
       }
@@ -3902,7 +4227,515 @@ export async function processAssignments({
       segments,
       now,
       periodByComputedPropertyId,
-      step: ComputedPropertyStep.ProcessAssignments,
+      step: ComputedPropertyStepEnum.ProcessAssignments,
     });
   });
+}
+
+enum PrunedType {
+  ComputedPropertyQuery = "ComputedPropertyQuery",
+  ComputedPropertyValue = "ComputedPropertyValue",
+}
+
+interface PrunedComputedPropertyNodeQuery {
+  type: PrunedType.ComputedPropertyQuery;
+  // query expression which if it evaluates to false will cause the state node to not be recalculated
+  expression: string;
+  computedPropertyId: string;
+  stateId: string;
+  varName: string;
+}
+
+interface PrunedComputedPropertyNodeValue {
+  type: PrunedType.ComputedPropertyValue;
+  computedPropertyId: string;
+  stateId: string;
+}
+
+type PrunedComputedPropertyNode =
+  | PrunedComputedPropertyNodeQuery
+  | PrunedComputedPropertyNodeValue;
+
+function leafUserPropertyToPruned({
+  userProperty,
+  node,
+  qb,
+}: {
+  userProperty: SavedUserPropertyResource;
+  node: LeafUserPropertyDefinition;
+  qb: ClickHouseQueryBuilder;
+}): PrunedComputedPropertyNode[] {
+  const stateId = userPropertyStateId(userProperty, node.id);
+  if (!stateId) {
+    return [];
+  }
+  switch (node.type) {
+    case UserPropertyDefinitionType.Trait: {
+      const path = toJsonPathParamCh({
+        path: node.path,
+        qb,
+      });
+      if (!path) {
+        return [];
+      }
+      const varName = qb.getVariableName();
+      const expression = `coalesce(any(nullIf(event_type == 'identify' and JSON_EXISTS(properties, ${path}), 0)), 0) as ${varName}`;
+      return [
+        {
+          type: PrunedType.ComputedPropertyQuery,
+          computedPropertyId: userProperty.id,
+          stateId,
+          varName,
+          expression,
+        },
+      ];
+    }
+    case UserPropertyDefinitionType.Performed: {
+      const varName = qb.getVariableName();
+      const path = toJsonPathParamCh({
+        path: node.path,
+        qb,
+      });
+      if (!path) {
+        return [];
+      }
+      const conditions: string[] = [
+        "event_type == 'track'",
+        `JSON_EXISTS(properties, ${path})`,
+      ];
+      const prefixCondition = getPrefixCondition({
+        column: "event",
+        value: node.event,
+        qb,
+      });
+      if (prefixCondition) {
+        conditions.push(prefixCondition);
+      }
+      const expression = `coalesce(any(nullIf(${conditions.join(" and ")}, 0)), 0) as ${varName}`;
+      return [
+        {
+          type: PrunedType.ComputedPropertyQuery,
+          computedPropertyId: userProperty.id,
+          stateId,
+          varName,
+          expression,
+        },
+      ];
+    }
+    default: {
+      return [];
+    }
+  }
+}
+
+function groupedUserPropertyToPruned({
+  userProperty,
+  node,
+  group,
+  qb,
+}: {
+  userProperty: SavedUserPropertyResource;
+  node: GroupChildrenUserPropertyDefinitions;
+  group: GroupUserPropertyDefinition;
+  qb: ClickHouseQueryBuilder;
+}): PrunedComputedPropertyNode[] {
+  switch (node.type) {
+    case UserPropertyDefinitionType.AnyOf: {
+      return node.children.flatMap((child) => {
+        const childNode = group.nodes.find((n) => n.id === child);
+        if (!childNode) {
+          logger().error(
+            {
+              userProperty,
+              child,
+            },
+            "Grouped user property child node not found",
+          );
+          return [];
+        }
+        return groupedUserPropertyToPruned({
+          userProperty,
+          node: childNode,
+          group,
+          qb,
+        });
+      });
+    }
+    case UserPropertyDefinitionType.Trait: {
+      return leafUserPropertyToPruned({
+        userProperty,
+        node,
+        qb,
+      });
+    }
+    case UserPropertyDefinitionType.Performed: {
+      return leafUserPropertyToPruned({
+        userProperty,
+        node,
+        qb,
+      });
+    }
+    default: {
+      return [];
+    }
+  }
+}
+
+function userPropertyNodeToPruned({
+  userProperty,
+  qb,
+}: {
+  userProperty: SavedUserPropertyResource;
+  qb: ClickHouseQueryBuilder;
+}): PrunedComputedPropertyNode[] {
+  switch (userProperty.definition.type) {
+    case UserPropertyDefinitionType.Group: {
+      const entryId = userProperty.definition.entry;
+      const entryNode = userProperty.definition.nodes.find(
+        (n) => n.id === entryId,
+      );
+      if (!entryNode) {
+        logger().error(
+          {
+            userProperty,
+            entryId,
+          },
+          "Grouped user property entry node not found",
+        );
+        return [];
+      }
+      return groupedUserPropertyToPruned({
+        userProperty,
+        node: entryNode,
+        group: userProperty.definition,
+        qb,
+      });
+    }
+    case UserPropertyDefinitionType.Performed: {
+      return leafUserPropertyToPruned({
+        userProperty,
+        node: userProperty.definition,
+        qb,
+      });
+    }
+    case UserPropertyDefinitionType.Trait: {
+      return leafUserPropertyToPruned({
+        userProperty,
+        node: userProperty.definition,
+        qb,
+      });
+    }
+    default: {
+      return [];
+    }
+  }
+}
+
+function segmentNodeToPruned({
+  segment,
+  node,
+  qb,
+}: {
+  segment: SavedSegmentResource;
+  node: SegmentNode;
+  qb: ClickHouseQueryBuilder;
+}): PrunedComputedPropertyNode[] {
+  const stateId = segmentNodeStateId(segment, node.id);
+  if (!stateId) {
+    return [];
+  }
+  switch (node.type) {
+    case SegmentNodeType.KeyedPerformed:
+      return [
+        {
+          type: PrunedType.ComputedPropertyValue,
+          computedPropertyId: segment.id,
+          stateId,
+        },
+      ];
+    case SegmentNodeType.Trait: {
+      const path = toJsonPathParamCh({
+        path: node.path,
+        qb,
+      });
+      if (!path) {
+        return [];
+      }
+      switch (node.operator.type) {
+        case SegmentOperatorType.Equals:
+        case SegmentOperatorType.NotEquals:
+        case SegmentOperatorType.Exists:
+        case SegmentOperatorType.GreaterThanOrEqual:
+        case SegmentOperatorType.LessThan: {
+          const varName = qb.getVariableName();
+          return [
+            {
+              type: PrunedType.ComputedPropertyQuery,
+              computedPropertyId: segment.id,
+              expression: `coalesce(any(nullIf(event_type == 'identify' and JSON_EXISTS(properties, ${path}), 0)), 0) as ${varName}`,
+              stateId,
+              varName,
+            },
+          ];
+          break;
+        }
+        default:
+          return [];
+          break;
+      }
+      break;
+    }
+    case SegmentNodeType.SubscriptionGroup: {
+      const lastPerformedNode = subscriptionChangeToPerformed(node);
+      return segmentNodeToPruned({
+        segment,
+        node: lastPerformedNode,
+        qb,
+      });
+    }
+    case SegmentNodeType.LastPerformed: {
+      const varName = qb.getVariableName();
+      const conditions: string[] = ["event_type == 'track'"];
+      const prefixCondition = getPrefixCondition({
+        column: "event",
+        value: node.event,
+        qb,
+      });
+      if (prefixCondition) {
+        conditions.push(prefixCondition);
+      }
+
+      const expression = `coalesce(any(nullIf(${conditions.join(" and ")}, 0)), 0) as ${varName}`;
+      // TODO implement where condition
+      return [
+        {
+          type: PrunedType.ComputedPropertyQuery,
+          computedPropertyId: segment.id,
+          expression,
+          stateId,
+          varName,
+        },
+      ];
+    }
+    case SegmentNodeType.And: {
+      return node.children.flatMap((child) => {
+        const childNode = segment.definition.nodes.find((n) => n.id === child);
+        if (!childNode) {
+          logger().error(
+            {
+              segment,
+              child,
+              node,
+            },
+            "AND child node not found",
+          );
+          return [];
+        }
+        return segmentNodeToPruned({
+          segment,
+          node: childNode,
+          qb,
+        });
+      });
+    }
+    case SegmentNodeType.Or: {
+      return node.children.flatMap((child) => {
+        const childNode = segment.definition.nodes.find((n) => n.id === child);
+        if (!childNode) {
+          logger().error(
+            {
+              segment,
+              child,
+              node,
+            },
+            "OR child node not found",
+          );
+          return [];
+        }
+        return segmentNodeToPruned({
+          segment,
+          node: childNode,
+          qb,
+        });
+      });
+    }
+    default:
+      return [];
+      break;
+  }
+}
+
+function canPrune({
+  definitionUpdatedAt,
+  createdAt,
+  now,
+  periodBound,
+}: {
+  definitionUpdatedAt: number;
+  createdAt: number;
+  now: number;
+  periodBound?: number;
+}): boolean {
+  if (!periodBound) {
+    return false;
+  }
+  // can't prune if created in the last period
+  if (createdAt <= now && createdAt >= periodBound) {
+    return false;
+  }
+  // can't prune if definition updated in the last period
+  if (definitionUpdatedAt <= now && definitionUpdatedAt >= periodBound) {
+    return false;
+  }
+  return true;
+}
+
+export async function pruneComputedProperties({
+  now,
+  workspaceId,
+  segments,
+  userProperties,
+}: Omit<
+  ComputePropertiesArgs,
+  "journeys" | "integrations"
+>): Promise<PrunedComputedProperties> {
+  const qb = new ClickHouseQueryBuilder();
+  const prunedSegments = new Set<string>();
+  const prunedUserProperties = new Set<string>();
+
+  const periodByComputedPropertyId = await getPeriodsByComputedPropertyId({
+    workspaceId,
+    step: ComputedPropertyStepEnum.ComputeState,
+  });
+
+  const pendingSegments: PrunedComputedPropertyNode[] = segments.flatMap(
+    (segment) => {
+      const period = periodByComputedPropertyId.get({
+        computedPropertyId: segment.id,
+        version: segment.definitionUpdatedAt.toString(),
+      });
+      const prunable = canPrune({
+        definitionUpdatedAt: segment.definitionUpdatedAt,
+        createdAt: segment.createdAt,
+        now,
+        periodBound: period?.maxTo.getTime(),
+      });
+      if (!prunable) {
+        return [];
+      }
+
+      return segmentNodeToPruned({
+        segment,
+        node: segment.definition.entryNode,
+        qb,
+      });
+    },
+  );
+
+  const pendingUserProperties: PrunedComputedPropertyNode[] =
+    userProperties.flatMap((userProperty) => {
+      const period = periodByComputedPropertyId.get({
+        computedPropertyId: userProperty.id,
+        version: userProperty.definitionUpdatedAt.toString(),
+      });
+      const prunable = canPrune({
+        definitionUpdatedAt: userProperty.definitionUpdatedAt,
+        createdAt: userProperty.createdAt,
+        now,
+        periodBound: period?.maxTo.getTime(),
+      });
+      if (!prunable) {
+        return [];
+      }
+      const nodes = userPropertyNodeToPruned({
+        userProperty,
+        qb,
+      });
+      return nodes;
+    });
+
+  const allPending = pendingSegments.concat(pendingUserProperties);
+  const computedPropertiesValues = allPending.flatMap((node) => {
+    if (node.type !== PrunedType.ComputedPropertyQuery) {
+      return [];
+    }
+    return node.expression;
+  });
+
+  pendingUserProperties.forEach((node) => {
+    if (node.type !== PrunedType.ComputedPropertyValue) {
+      return;
+    }
+    prunedUserProperties.add(node.stateId);
+  });
+
+  pendingSegments.forEach((node) => {
+    if (node.type !== PrunedType.ComputedPropertyValue) {
+      return;
+    }
+    prunedSegments.add(node.stateId);
+  });
+  const nowSeconds = now / 1000;
+  let computedPropertiesPresent: Record<string, 1 | 0> | null = null;
+
+  if (computedPropertiesValues.length) {
+    const computedPropertiesValuesQueryFragment =
+      computedPropertiesValues.join(",");
+    let minPeriodBound: Period | null = null;
+
+    for (const period of periodByComputedPropertyId.getAll()) {
+      if (!minPeriodBound) {
+        minPeriodBound = period;
+        continue;
+      }
+      if (period.maxTo.getTime() < minPeriodBound.maxTo.getTime()) {
+        minPeriodBound = period;
+      }
+    }
+    const lowerBoundClause = minPeriodBound
+      ? `and processing_time >= toDateTime64(${minPeriodBound.maxTo.getTime() / 1000}, 3)`
+      : "";
+
+    const query = `
+    select ${computedPropertiesValuesQueryFragment}
+    from user_events_v2
+    where
+      workspace_id = ${qb.addQueryValue(workspaceId, "String")}
+      and processing_time <= toDateTime64(${nowSeconds}, 3)
+      ${lowerBoundClause}
+    limit 1;
+  `;
+    const result = await chQuery({
+      query,
+      query_params: qb.getQueries(),
+    });
+
+    const [row] = await result.json<Record<string, 1 | 0>>();
+    computedPropertiesPresent = row ?? null;
+  }
+
+  if (computedPropertiesPresent) {
+    pendingSegments.forEach((node) => {
+      if (node.type !== PrunedType.ComputedPropertyQuery) {
+        return;
+      }
+      if (computedPropertiesPresent[node.varName] !== 1) {
+        prunedSegments.add(node.stateId);
+      }
+    });
+    pendingUserProperties.forEach((node) => {
+      if (node.type !== PrunedType.ComputedPropertyQuery) {
+        return;
+      }
+      const isMissing = computedPropertiesPresent[node.varName] !== 1;
+      if (isMissing) {
+        prunedUserProperties.add(node.stateId);
+      }
+    });
+  }
+
+  return {
+    segments: prunedSegments,
+    userProperties: prunedUserProperties,
+  };
 }

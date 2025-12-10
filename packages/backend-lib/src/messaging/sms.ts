@@ -10,20 +10,11 @@ import {
 } from "../db/schema";
 import logger from "../logger";
 import {
-  ChannelType,
   PersistedSmsProvider,
   SmsProvider,
   SmsProviderType,
-  SmsTemplateResource,
   UpsertSmsProviderRequest,
 } from "../types";
-
-export function defaultSmsDefinition(): SmsTemplateResource {
-  return {
-    type: ChannelType.Sms,
-    body: "Example message to {{ user.phone }}",
-  };
-}
 
 export async function upsertSmsProvider({
   workspaceId,
@@ -112,8 +103,17 @@ export async function getOrCreateSmsProviders({
       case SmsProviderType.Test:
         type = SmsProviderType.Test;
         break;
+      case SmsProviderType.SignalWire:
+        type = SmsProviderType.SignalWire;
+        break;
       default:
-        logger().error(`Unknown email provider type: ${ep.type}`);
+        logger().error(
+          {
+            workspaceId,
+            smsProviderType: ep.type,
+          },
+          "Unknown sms provider type",
+        );
         return [];
     }
     return {

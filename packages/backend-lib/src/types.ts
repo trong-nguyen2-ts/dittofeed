@@ -26,9 +26,11 @@ import { type Logger as PinoLogger } from "pino";
 import { Overwrite } from "utility-types";
 
 import {
+  adminApiKey as dbAdminApiKey,
   broadcast as dbBroadcast,
   componentConfiguration as dbComponentConfiguration,
   computedPropertyPeriod as dbComputedPropertyPeriod,
+  DBWorkspaceOccupantType,
   emailProvider as dbEmailProvider,
   integration as dbIntegration,
   journey as dbJourney,
@@ -44,6 +46,7 @@ import {
   userPropertyAssignment as dbUserPropertyAssignment,
   workspace as dbWorkspace,
   workspaceMember as dbWorkspaceMember,
+  workspaceMemberRole as dbWorkspaceMemberRole,
   workspaceType as dbWorkspaceType,
   writeKey as dbWriteKey,
 } from "./db/schema";
@@ -63,6 +66,10 @@ export enum KafkaMessageTypes {
 }
 
 export type WorkspaceMember = InferSelectModel<typeof dbWorkspaceMember>;
+
+export type WorkspaceMemberRole = InferSelectModel<
+  typeof dbWorkspaceMemberRole
+>;
 
 export type Segment = InferSelectModel<typeof dbSegment>;
 
@@ -92,6 +99,8 @@ export type MessageTemplate = InferSelectModel<typeof dbMessageTemplate>;
 
 export type Secret = InferSelectModel<typeof dbSecret>;
 
+export type AdminApiKey = InferSelectModel<typeof dbAdminApiKey>;
+
 export type WriteKey = InferSelectModel<typeof dbWriteKey>;
 
 export type ComponentConfiguration = InferSelectModel<
@@ -110,6 +119,9 @@ export type UserJourneyEvent = InferSelectModel<typeof dbUserJourneyEvent>;
 export interface EnrichedSegment extends Omit<Segment, "definition"> {
   definition: SegmentDefinition;
 }
+
+export type DBWorkspaceOccupantType =
+  (typeof DBWorkspaceOccupantType.enumValues)[number];
 
 export interface EnrichedJourney extends Omit<Journey, "definition" | "draft"> {
   definition?: JourneyDefinition;
@@ -214,7 +226,11 @@ export type LogLevel = Static<typeof LogLevel>;
 export const OpenIdProfile = Type.Object({
   sub: Type.String(),
   email: Type.String(),
-  email_verified: Type.Boolean(),
+  email_verified: Type.Union([
+    Type.Literal("true"),
+    Type.Literal("false"),
+    Type.Boolean(),
+  ]),
   picture: Type.Optional(Type.String()),
   name: Type.Optional(Type.String()),
   nickname: Type.Optional(Type.String()),
@@ -566,6 +582,7 @@ export const MessageMetadataFields = Type.Object({
   templateId: Type.Optional(Type.String()),
   nodeId: Type.Optional(Type.String()),
   journeyId: Type.Optional(Type.String()),
+  broadcastId: Type.Optional(Type.String()),
 });
 
 export type MessageMetadataFields = Static<typeof MessageMetadataFields>;
@@ -575,8 +592,9 @@ export const SendgridEvent = Type.Composite([
     email: Type.String(),
     timestamp: Type.Integer(),
     event: Type.Enum(SendgridEventType),
+    "smtp-id": Type.Optional(Type.String()),
     sg_event_id: Type.String(),
-    sg_message_id: Type.String(),
+    sg_message_id: Type.Optional(Type.String()),
     ip: Type.Optional(Type.String()),
     reason: Type.Optional(Type.String()),
     pool: Type.Optional(
@@ -710,12 +728,6 @@ export type DittofeedFastifyInstance = FastifyInstance<
   TypeBoxTypeProvider
 >;
 
-export enum ComputedPropertyStep {
-  ComputeState = "ComputeState",
-  ComputeAssignments = "ComputeAssignments",
-  ProcessAssignments = "ProcessAssignments",
-}
-
 export enum RequestContextErrorType {
   Unauthorized = "Unauthorized",
   NotOnboarded = "NotOnboarded",
@@ -794,3 +806,76 @@ export type RequestContextResult = Result<
 export type RequestContextPostProcessor = (
   result: RequestContextResult,
 ) => Promise<RequestContextResult>;
+
+export const WorkspaceQueueItemType = {
+  Workspace: "Workspace",
+  Segment: "Segment",
+  UserProperty: "UserProperty",
+  Integration: "Integration",
+  Journey: "Journey",
+  Batch: "Batch",
+} as const;
+
+export type WorkspaceQueueItemType =
+  (typeof WorkspaceQueueItemType)[keyof typeof WorkspaceQueueItemType];
+
+export interface EntireWorkspaceQueueItem {
+  id: string;
+  type?: typeof WorkspaceQueueItemType.Workspace;
+  priority?: number;
+  // for backwards compatibility
+  maxPeriod?: number;
+  period?: number;
+  insertedAt?: number; // Number representing insertion order
+}
+
+export interface BaseComputedPropertyBatchQueueItem {
+  workspaceId: string;
+  priority?: number;
+  // for backwards compatibility
+  maxPeriod?: number;
+  period?: number;
+  insertedAt?: number; // Number representing insertion order
+}
+
+export interface BaseComputedPropertyIndividualQueueItem
+  extends BaseComputedPropertyBatchQueueItem {
+  id: string;
+}
+
+export interface SegmentQueueItem
+  extends BaseComputedPropertyIndividualQueueItem {
+  type: typeof WorkspaceQueueItemType.Segment;
+}
+
+export interface UserPropertyQueueItem
+  extends BaseComputedPropertyIndividualQueueItem {
+  type: typeof WorkspaceQueueItemType.UserProperty;
+}
+
+export interface IntegrationQueueItem
+  extends BaseComputedPropertyIndividualQueueItem {
+  type: typeof WorkspaceQueueItemType.Integration;
+}
+
+export interface JourneyQueueItem
+  extends BaseComputedPropertyIndividualQueueItem {
+  type: typeof WorkspaceQueueItemType.Journey;
+}
+
+export type IndividualComputedPropertyQueueItem =
+  | SegmentQueueItem
+  | UserPropertyQueueItem
+  | IntegrationQueueItem
+  | JourneyQueueItem;
+
+export interface BatchComputedPropertyQueueItem
+  extends BaseComputedPropertyBatchQueueItem {
+  type: typeof WorkspaceQueueItemType.Batch;
+  items: IndividualComputedPropertyQueueItem[];
+}
+
+export type WorkspaceQueueItem =
+  | EntireWorkspaceQueueItem
+  | IndividualComputedPropertyQueueItem
+  | BatchComputedPropertyQueueItem;
