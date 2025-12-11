@@ -3,10 +3,11 @@ import logger from "backend-lib/src/logger";
 import { DittofeedFastifyInstance } from "backend-lib/src/types";
 import { FastifyInstance } from "fastify";
 
-import adminBroadcastsController from "../controllers/adminBroadcastsController";
+import analysisController from "../controllers/analysisController";
 import apiKeyController from "../controllers/apiKeyController";
 import broadcastsController from "../controllers/broadcastsController";
 import componentConfigurationsController from "../controllers/componentConfigurationsController";
+import computedPropertiesController from "../controllers/computedPropertiesController";
 import contentController from "../controllers/contentController";
 import debugController from "../controllers/debugController";
 import deliveriesController from "../controllers/deliveriesController";
@@ -15,6 +16,7 @@ import groupsController from "../controllers/groupsController";
 import indexController from "../controllers/indexController";
 import integrationsController from "../controllers/integrationsController";
 import journeysController from "../controllers/journeysController";
+import permissionsController from "../controllers/permissionsController";
 import publicAppsController from "../controllers/publicAppsController";
 import resourcesController from "../controllers/resourcesController";
 import secretsController from "../controllers/secretsController";
@@ -24,6 +26,7 @@ import authController from "../controllers/singleTenantController";
 import subscriptionGroupsController from "../controllers/subscriptionGroupsController";
 import subscriptionManagementController from "../controllers/subscriptionManagementController";
 import userPropertiesController from "../controllers/userPropertiesController";
+import userPropertyIndexController from "../controllers/userPropertyIndexController";
 import usersController from "../controllers/usersController";
 import webhooksController from "../controllers/webhooksController";
 import { BuildAppOpts } from "../types";
@@ -46,6 +49,7 @@ export default async function router(
       await fastify.register(requestContext);
 
       await Promise.all([
+        f.register(analysisController, { prefix: "/analysis" }),
         f.register(contentController, { prefix: "/content" }),
         f.register(eventsController, { prefix: "/events" }),
         f.register(journeysController, { prefix: "/journeys" }),
@@ -53,10 +57,14 @@ export default async function router(
         f.register(segmentsController, { prefix: "/segments" }),
         f.register(settingsController, { prefix: "/settings" }),
         f.register(integrationsController, { prefix: "/integrations" }),
+        f.register(permissionsController, { prefix: "/permissions" }),
         f.register(subscriptionGroupsController, {
           prefix: "/subscription-groups",
         }),
         f.register(userPropertiesController, { prefix: "/user-properties" }),
+        f.register(userPropertyIndexController, {
+          prefix: "/user-property-indices",
+        }),
         f.register(broadcastsController, {
           prefix: "/broadcasts",
         }),
@@ -67,6 +75,9 @@ export default async function router(
         f.register(usersController, { prefix: "/users" }),
         f.register(groupsController, { prefix: "/groups" }),
         f.register(resourcesController, { prefix: "/resources" }),
+        f.register(computedPropertiesController, {
+          prefix: "/computed-properties",
+        }),
         // mount redundant webhooks controller at root level for backwards
         // compatibility. this is the one exception to this route namespace being auth'd.
         f.register(webhooksController, { prefix: "/webhooks" }),
@@ -114,10 +125,14 @@ export default async function router(
         f.register(componentConfigurationsController, {
           prefix: "/component-configurations",
         }),
-        f.register(adminBroadcastsController, {
+        f.register(broadcastsController, {
           prefix: "/broadcasts",
         }),
         f.register(groupsController, { prefix: "/groups" }),
+        f.register(computedPropertiesController, {
+          prefix: "/computed-properties",
+        }),
+        f.register(analysisController, { prefix: "/analysis" }),
       ]);
     },
     { prefix: "/api/admin" },

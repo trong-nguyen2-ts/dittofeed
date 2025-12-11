@@ -1,11 +1,20 @@
-import { SpanStatusCode } from "@opentelemetry/api";
+import { Histogram, SpanStatusCode } from "@opentelemetry/api";
+import { Context } from "@temporalio/activity";
 import { and, eq, inArray } from "drizzle-orm";
 import { ENTRY_TYPES } from "isomorphic-lib/src/constants";
 import { schemaValidateWithErr } from "isomorphic-lib/src/resultHandling/schemaValidation";
-import { err, ok } from "neverthrow";
+import { sleep } from "isomorphic-lib/src/time";
+import { err, Result } from "neverthrow";
+import pRetry from "p-retry";
 import { omit } from "remeda";
 
 import { submitTrack } from "../../apps/track";
+import { getEarliestComputePropertyPeriod } from "../../computedProperties/periods";
+import config from "../../config";
+import {
+  WORKFLOW_HISTORY_LENGTH_METRIC,
+  WORKFLOW_HISTORY_SIZE_METRIC,
+} from "../../constants";
 import { db } from "../../db";
 import {
   journey as dbJourney,
@@ -15,7 +24,7 @@ import {
 } from "../../db/schema";
 import logger from "../../logger";
 import { Sender, sendMessage, SendMessageParameters } from "../../messaging";
-import { withSpan } from "../../openTelemetry";
+import { getMeter, withSpan } from "../../openTelemetry";
 import { calculateKeyedSegment, getSegmentAssignmentDb } from "../../segments";
 import {
   getSubscriptionGroupDetails,
@@ -28,8 +37,10 @@ import {
   JourneyDefinition,
   JourneyNodeType,
   JSONValue,
+  MessageSendFailure,
+  MessageSuccess,
+  MessageTags,
   MessageVariant,
-  OptionalAllOrNothing,
   RenameKey,
   SegmentAssignment,
   SegmentDefinition,
@@ -37,6 +48,10 @@ import {
   TrackData,
   UserWorkflowTrackEvent,
 } from "../../types";
+import {
+  GetEventsByIdParams,
+  getTrackEventsById as gebi,
+} from "../../userEvents";
 import { findAllUserPropertyAssignments } from "../../userProperties";
 import {
   recordNodeProcessed,
@@ -44,8 +59,71 @@ import {
 } from "../recordNodeProcessed";
 import { GetSegmentAssignmentVersion } from "./types";
 
-export { findNextLocalizedTime, getUserPropertyDelay } from "../../dates";
+export {
+  findNextLocalizedTime,
+  findNextLocalizedTimeV2,
+  getUserPropertyDelay,
+} from "../../dates";
 export { findAllUserPropertyAssignments } from "../../userProperties";
+export { getEarliestComputePropertyPeriod };
+
+function safeWorkflowId(): string | undefined {
+  try {
+    return Context.current().info.workflowExecution.workflowId;
+  } catch (error) {
+    logger().debug({ err: error }, "failed to read workflow id from context");
+    return undefined;
+  }
+}
+
+export async function getEventsById(
+  params: GetEventsByIdParams,
+  metadata?: { journeyId?: string; userId: string },
+): Promise<UserWorkflowTrackEvent[]> {
+  const events = await gebi(params);
+  const missing = params.eventIds.filter(
+    (id) => !events.some((e) => e.messageId === id),
+  );
+  if (missing.length > 0) {
+    const workflowId = safeWorkflowId();
+    logger().info(
+      {
+        workspaceId: params.workspaceId,
+        missing,
+        journeyId: metadata?.journeyId,
+        userId: metadata?.userId,
+        workflowId,
+      },
+      "not all events found for user journey",
+    );
+    throw new Error("not all events found for user journey");
+  }
+  return events;
+}
+
+export async function getEventsByIdWithRetry(
+  params: GetEventsByIdParams,
+  metadata: { journeyId?: string; userId: string },
+) {
+  try {
+    // Defaults to 10 retries
+    const events = await pRetry(() => getEventsById(params, metadata));
+    return events;
+  } catch (e) {
+    const workflowId = safeWorkflowId();
+    logger().error(
+      {
+        err: e,
+        workspaceId: params.workspaceId,
+        journeyId: metadata.journeyId,
+        userId: metadata.userId,
+        workflowId,
+      },
+      "not all events found for user journey after retries",
+    );
+    throw e;
+  }
+}
 
 type BaseSendParams = {
   userId: string;
@@ -63,12 +141,24 @@ export type SendParams = Omit<BaseSendParams, "channel">;
 export type SendParamsV2 = BaseSendParams & {
   context?: Record<string, JSONValue>;
   events?: UserWorkflowTrackEvent[];
+  eventIds?: string[];
   isHidden?: boolean;
+  retryCount?: number;
 };
 
 export type SendParamsInner = SendParamsV2 & {
   sender: (params: SendMessageParameters) => Promise<BackendMessageSendResult>;
 };
+
+interface JourneyEarlyExit {
+  type: InternalEventType.JourneyEarlyExit;
+  message: string;
+}
+
+type SendMessageInnerResult = Result<
+  MessageSuccess,
+  MessageSendFailure | JourneyEarlyExit
+>;
 
 async function sendMessageInner({
   userId,
@@ -82,11 +172,25 @@ async function sendMessageInner({
   context: deprecatedContext,
   events,
   sender,
+  retryCount,
   ...rest
-}: SendParamsInner): Promise<BackendMessageSendResult> {
+}: SendParamsInner): Promise<SendMessageInnerResult> {
   let context: Record<string, JSONValue>[] | undefined;
+  // passing full events is also deprecated
   if (events) {
     context = events.flatMap((e) => e.properties ?? []);
+  } else if (rest.eventIds) {
+    const eventsById = await getEventsByIdWithRetry(
+      {
+        workspaceId,
+        eventIds: rest.eventIds,
+      },
+      {
+        journeyId,
+        userId,
+      },
+    );
+    context = eventsById.flatMap((e) => e.properties ?? []);
   } else if (deprecatedContext) {
     context = [deprecatedContext];
   }
@@ -95,7 +199,11 @@ async function sendMessageInner({
       findAllUserPropertyAssignments({ userId, workspaceId, context }),
       db().query.journey.findFirst({ where: eq(dbJourney.id, journeyId) }),
       subscriptionGroupId
-        ? getSubscriptionGroupWithAssignment({ userId, subscriptionGroupId })
+        ? getSubscriptionGroupWithAssignment({
+            userId,
+            workspaceId,
+            subscriptionGroupId,
+          })
         : null,
     ]);
 
@@ -116,38 +224,93 @@ async function sendMessageInner({
   }
 
   if (!(journey.status === "Running" || journey.status === "Broadcast")) {
-    return ok({
-      type: InternalEventType.MessageSkipped,
-      message: "Journey is not running",
+    return err({
+      type: InternalEventType.JourneyEarlyExit,
+      message: `Journey is not running: ${journey.status}`,
     });
   }
 
-  const result = await sender({
+  const messageTags: MessageTags = {
     workspaceId,
-    useDraft: false,
+    runId,
+    nodeId,
+    journeyId,
     templateId,
+    messageId,
     userId,
-    userPropertyAssignments,
-    subscriptionGroupDetails,
-    ...rest,
-    messageTags: {
+    channel: rest.channel,
+  };
+  if (rest.triggeringMessageId) {
+    messageTags.triggeringMessageId = rest.triggeringMessageId;
+  }
+
+  try {
+    const result = await sender({
       workspaceId,
-      runId,
-      nodeId,
-      journeyId,
+      useDraft: false,
       templateId,
-      messageId,
       userId,
-      channel: rest.channel,
-    },
-  });
-  return result;
+      userPropertyAssignments,
+      subscriptionGroupDetails,
+      messageTags,
+      ...rest,
+    });
+    return result;
+  } catch (senderError) {
+    // Check if we're in the final retry attempt
+    const activityInfo = Context.current().info;
+    const isLastAttempt = activityInfo.attempt >= (retryCount ?? 3);
+
+    if (isLastAttempt) {
+      logger().error("sender failed after maximum retry attempts", {
+        workspaceId,
+        userId,
+        messageId,
+        templateId,
+        attempt: activityInfo.attempt,
+        maxAttempts: retryCount,
+        err: senderError,
+      });
+
+      const senderErrorString =
+        senderError instanceof Error
+          ? senderError.message
+          : String(senderError);
+
+      // Return a MessageSkipped result instead of throwing
+      return err({
+        type: InternalEventType.JourneyEarlyExit,
+        message: `Message failed after maximum retry attempts: ${senderErrorString}`,
+      });
+    }
+
+    // Not the final attempt, rethrow to allow retry
+    throw senderError;
+  }
 }
 
 export function sendMessageFactory(sender: Sender) {
   return async function sendMessageWithSender(
     params: SendParamsV2,
   ): Promise<boolean> {
+    const journey = await db().query.journey.findFirst({
+      where: and(
+        eq(dbJourney.id, params.journeyId),
+        eq(dbJourney.workspaceId, params.workspaceId),
+      ),
+    });
+    if (!journey || journey.status !== "Running") {
+      logger().debug(
+        {
+          journeyId: params.journeyId,
+          workspaceId: params.workspaceId,
+          journeyStatus: journey?.status,
+        },
+        "journey not found or not running",
+      );
+      return false;
+    }
+
     return withSpan({ name: "sendMessageWithSender" }, async (span) => {
       span.setAttributes({
         workspaceId: params.workspaceId,
@@ -253,6 +416,16 @@ export async function isRunnable({
         })
       : null,
   ]);
+  logger().debug(
+    {
+      previousExitEvent,
+      journeyId,
+      userId,
+      eventKey,
+      eventKeyName,
+    },
+    "previous exit event found, checking if journey is runnable",
+  );
   if (!previousExitEvent) {
     return true;
   }
@@ -274,6 +447,12 @@ export async function isRunnable({
     );
   }
   if (workspace?.status !== "Active") {
+    logger().debug(
+      {
+        workspace: workspace ?? "missing",
+      },
+      "workspace is not active, journey is not runnable",
+    );
     return false;
   }
   return canRunMultiple;
@@ -283,20 +462,36 @@ export async function onNodeProcessedV2(params: RecordNodeProcessedParams) {
   await recordNodeProcessed(params);
 }
 
+export interface BaseGetSegmentAssignmentParams {
+  workspaceId: string;
+  segmentId: string;
+  userId: string;
+  journeyId?: string;
+}
+
+export interface KeyedGetSegmentAssignmentParamsV1
+  extends BaseGetSegmentAssignmentParams {
+  keyValue: string;
+  nowMs: number;
+  events: UserWorkflowTrackEvent[];
+  version: GetSegmentAssignmentVersion.V1;
+}
+
+export interface KeyedGetSegmentAssignmentParamsV2
+  extends BaseGetSegmentAssignmentParams {
+  keyValue: string;
+  nowMs: number;
+  eventIds: string[];
+  version: GetSegmentAssignmentVersion.V2;
+}
+
+export type GetSegmentAssignmentParams =
+  | BaseGetSegmentAssignmentParams
+  | KeyedGetSegmentAssignmentParamsV1
+  | KeyedGetSegmentAssignmentParamsV2;
+
 export async function getSegmentAssignment(
-  params: OptionalAllOrNothing<
-    {
-      workspaceId: string;
-      segmentId: string;
-      userId: string;
-    },
-    {
-      keyValue: string;
-      nowMs: number;
-      events: UserWorkflowTrackEvent[];
-      version: GetSegmentAssignmentVersion.V1;
-    }
-  >,
+  params: GetSegmentAssignmentParams,
 ): Promise<SegmentAssignment | null> {
   return withSpan({ name: "get-segment-assignment" }, async (span) => {
     span.setAttributes({
@@ -322,14 +517,7 @@ export async function getSegmentAssignment(
       });
       return null;
     }
-    if (
-      !(
-        "version" in params &&
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-        params.version === GetSegmentAssignmentVersion.V1
-      )
-    ) {
-      span.setAttribute("version", GetSegmentAssignmentVersion.V1);
+    if (!("version" in params)) {
       const assignment =
         (await getSegmentAssignmentDb({
           workspaceId,
@@ -349,7 +537,25 @@ export async function getSegmentAssignment(
         inSegment: assignment,
       };
     }
-
+    let events: UserWorkflowTrackEvent[];
+    switch (params.version) {
+      case GetSegmentAssignmentVersion.V1:
+        events = params.events;
+        break;
+      case GetSegmentAssignmentVersion.V2: {
+        events = await getEventsByIdWithRetry(
+          {
+            workspaceId,
+            eventIds: params.eventIds,
+          },
+          {
+            userId,
+            journeyId: params.journeyId,
+          },
+        );
+        break;
+      }
+    }
     const definitionResult = schemaValidateWithErr(
       segment.definition,
       SegmentDefinition,
@@ -383,7 +589,7 @@ export async function getSegmentAssignment(
       };
     }
     const inSegment = calculateKeyedSegment({
-      events: params.events,
+      events,
       keyValue: params.keyValue,
       definition: entryNode,
     });
@@ -406,7 +612,156 @@ export function getWorkspace(workspaceId: string) {
   });
 }
 
-export { getEarliestComputePropertyPeriod } from "../../computedProperties/periods";
+export interface WaitForComputePropertiesParams {
+  workspaceId: string;
+  after: number;
+  baseDelayMs?: number;
+  maxAttempts?: number;
+}
+
+// Polls for the earliest compute-property period to advance beyond `after`.
+// By default this will run up to ~18 minutes (5 attempts with exponential
+// backoff starting at 10s), but the base delay and attempt count can be tuned
+// via config or per-call overrides.
+const HEARTBEAT_CHUNK_MS = 10_000;
+
+async function sleepWithHeartbeat({
+  context,
+  delayMs,
+  heartbeatPayload,
+}: {
+  context: Context;
+  delayMs: number;
+  heartbeatPayload: Record<string, unknown>;
+}) {
+  let remaining = delayMs;
+  while (remaining > 0) {
+    const chunk = Math.min(HEARTBEAT_CHUNK_MS, remaining);
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(chunk);
+    remaining -= chunk;
+    context.heartbeat(heartbeatPayload);
+  }
+}
+
+// Polls for the earliest compute-property period to advance beyond `after`.
+// By default this will run up to ~18 minutes (5 attempts with exponential
+// backoff starting at 10s), but the base delay and attempt count can be tuned
+// via config or per-call overrides.
+export async function waitForComputeProperties({
+  workspaceId,
+  after,
+  baseDelayMs,
+  maxAttempts,
+}: WaitForComputePropertiesParams): Promise<boolean> {
+  const cfg = config();
+  const effectiveBaseDelayMs =
+    baseDelayMs ?? cfg.waitForComputePropertiesBaseDelayMs;
+  const effectiveMaxAttempts =
+    maxAttempts ?? cfg.waitForComputePropertiesMaxAttempts;
+  const context = Context.current();
+  logger().debug(
+    {
+      workspaceId,
+      after,
+      baseDelayMs: effectiveBaseDelayMs,
+      maxAttempts: effectiveMaxAttempts,
+    },
+    "waitForComputeProperties started",
+  );
+
+  for (let attempt = 0; attempt < effectiveMaxAttempts; attempt += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const period = await getEarliestComputePropertyPeriod({ workspaceId });
+
+    context.heartbeat({ attempt, period, workspaceId });
+    logger().debug(
+      {
+        workspaceId,
+        attempt,
+        period,
+        after,
+      },
+      "checking compute property sync progress",
+    );
+
+    const heartbeatPayload = { attempt, period, workspaceId, after };
+
+    if (period > after) {
+      logger().debug(
+        {
+          workspaceId,
+          period,
+          after,
+        },
+        "compute properties synced after message",
+      );
+      return true;
+    }
+
+    context.heartbeat(heartbeatPayload);
+
+    if (attempt === effectiveMaxAttempts - 1) {
+      break;
+    }
+
+    const delay = effectiveBaseDelayMs * 2 ** (attempt + 1);
+    logger().debug(
+      {
+        workspaceId,
+        delay,
+        attempt,
+      },
+      "compute properties not synced, sleeping before retry",
+    );
+
+    // eslint-disable-next-line no-await-in-loop
+    await sleepWithHeartbeat({
+      context,
+      delayMs: delay,
+      heartbeatPayload,
+    });
+  }
+
+  logger().warn(
+    {
+      workspaceId,
+      after,
+      attempts: effectiveMaxAttempts,
+    },
+    "waitForComputeProperties timed out",
+  );
+  return false;
+}
+
+let WORKFLOW_HISTORY_SIZE_HISTOGRAM: Histogram | null = null;
+let WORKFLOW_HISTORY_LENGTH_HISTOGRAM: Histogram | null = null;
+
+function workflowHistorySizeHistogram() {
+  if (WORKFLOW_HISTORY_SIZE_HISTOGRAM !== null) {
+    return WORKFLOW_HISTORY_SIZE_HISTOGRAM;
+  }
+  const meter = getMeter();
+  const histogram = meter.createHistogram(WORKFLOW_HISTORY_SIZE_METRIC, {
+    description: "Histogram for workflow history size in bytes",
+    unit: "bytes",
+  });
+  WORKFLOW_HISTORY_SIZE_HISTOGRAM = histogram;
+  return histogram;
+}
+
+function workflowHistoryLengthHistogram() {
+  if (WORKFLOW_HISTORY_LENGTH_HISTOGRAM !== null) {
+    return WORKFLOW_HISTORY_LENGTH_HISTOGRAM;
+  }
+  const meter = getMeter();
+  const histogram = meter.createHistogram(WORKFLOW_HISTORY_LENGTH_METRIC, {
+    description: "Histogram for workflow history length in events",
+    unit: "1",
+  });
+  WORKFLOW_HISTORY_LENGTH_HISTOGRAM = histogram;
+  return histogram;
+}
 
 export async function shouldReEnter({
   journeyId,
@@ -470,3 +825,47 @@ export async function shouldReEnter({
   });
   return assignment === true && definition.entryNode.reEnter === true;
 }
+
+// eslint-disable-next-line @typescript-eslint/require-await
+export async function reportWorkflowInfo({
+  historySize,
+  historyLength,
+  workspaceId,
+  journeyId,
+}: {
+  historySize: number;
+  historyLength: number;
+  workspaceId: string;
+  journeyId: string;
+}): Promise<void> {
+  const sizeHistogram = workflowHistorySizeHistogram();
+  const lengthHistogram = workflowHistoryLengthHistogram();
+  const journey = await db().query.journey.findFirst({
+    where: and(
+      eq(dbJourney.id, journeyId),
+      eq(dbJourney.workspaceId, workspaceId),
+    ),
+    columns: {
+      name: true,
+    },
+  });
+  if (!journey) {
+    logger().error(
+      {
+        journeyId,
+        workspaceId,
+      },
+      "journey not found",
+    );
+    return;
+  }
+
+  const attributes = {
+    workspaceId,
+    journeyName: journey.name,
+  } as const;
+  sizeHistogram.record(historySize, attributes);
+  lengthHistogram.record(historyLength, attributes);
+}
+
+export { getRandomNumber } from "../../temporal/activities/shared";

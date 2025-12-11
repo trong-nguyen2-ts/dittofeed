@@ -15,16 +15,16 @@ import {
   ReactFlowProvider,
 } from "@xyflow/react";
 import {
-  CompletionStatus,
   JourneyUiBodyNodeTypeProps,
   SavedSubscriptionGroupResource,
 } from "isomorphic-lib/src/types";
-import React, { DragEvent, DragEventHandler } from "react";
+import { DragEvent, DragEventHandler } from "react";
 import { v4 as uuid } from "uuid";
 
 import { useAppStorePick } from "../../lib/appStore";
 import { AppState, JourneyUiEdge, JourneyUiNode } from "../../lib/types";
 import { useJourneyStats } from "../../lib/useJourneyStats";
+import { useSubscriptionGroupsQuery } from "../../lib/useSubscriptionGroupsQuery";
 import edgeTypes from "./edgeTypes";
 import NodeEditor from "./nodeEditor";
 import nodeTypes from "./nodeTypes";
@@ -32,14 +32,17 @@ import { defaultBodyNodeTypeProps } from "./nodeTypes/defaultNodeTypeProps";
 import Sidebar from "./sidebar";
 import { createConnections } from "./store";
 
-const proOptions: ProOptions = { account: "paid-pro", hideAttribution: true };
+export const proOptions: ProOptions = {
+  account: "paid-pro",
+  hideAttribution: true,
+};
 
-const handleDragOver: DragEventHandler<HTMLDivElement> = (e) => {
+export const handleDragOver: DragEventHandler<HTMLDivElement> = (e) => {
   e.preventDefault();
 };
 
 // this function adds a new node and connects it to the source node
-function createNewConnections({
+export function createNewConnections({
   nodes,
   nodeType,
   source,
@@ -47,6 +50,7 @@ function createNewConnections({
   addNodes,
   subscriptionGroups,
   setSelectedNodeId,
+  newTargetId: newTargetIdOverride,
 }: {
   nodeType: JourneyUiBodyNodeTypeProps["type"];
   nodes: AppState["journeyNodes"];
@@ -55,9 +59,10 @@ function createNewConnections({
   target: string;
   subscriptionGroups: SavedSubscriptionGroupResource[];
   setSelectedNodeId: AppState["setSelectedNodeId"];
+  newTargetId?: string;
 }) {
   // TODO create an incremental ID based on the number of elements already in the graph
-  const newTargetId = uuid();
+  const newTargetId = newTargetIdOverride ?? uuid();
 
   const { newNodes, newEdges } = createConnections({
     id: newTargetId,
@@ -78,36 +83,26 @@ function JourneysBuilderInner({ journeyId }: { journeyId: string }) {
     journeyNodes: nodes,
     journeyEdges: edges,
     journeyDraggedComponentType: draggedComponentType,
-    apiBase,
-    workspace,
     upsertJourneyStats,
     setJourneyStatsRequest,
     viewDraft,
-    subscriptionGroups,
     setSelectedNodeId,
   } = useAppStorePick([
-    "apiBase",
     "setNodes",
     "addNodes",
     "setEdges",
     "journeyNodes",
     "journeyEdges",
     "journeyDraggedComponentType",
-    "workspace",
     "setJourneyStatsRequest",
     "upsertJourneyStats",
     "viewDraft",
-    "subscriptionGroups",
     "setSelectedNodeId",
   ]);
+  const { data: subscriptionGroups } = useSubscriptionGroupsQuery();
 
   useJourneyStats({
     journeyIds: [journeyId],
-    workspaceId:
-      workspace.type === CompletionStatus.Successful
-        ? workspace.value.id
-        : undefined,
-    apiBase,
     setJourneyStatsRequest,
     upsertJourneyStats,
   });
@@ -127,7 +122,7 @@ function JourneysBuilderInner({ journeyId }: { journeyId: string }) {
           target,
           addNodes,
           nodes,
-          subscriptionGroups,
+          subscriptionGroups: subscriptionGroups ?? [],
           setSelectedNodeId,
         });
       }
@@ -166,6 +161,7 @@ function JourneysBuilderInner({ journeyId }: { journeyId: string }) {
         proOptions={proOptions}
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
+        noDragClassName="nodrag"
         defaultEdgeOptions={{
           markerEnd: {
             type: MarkerType.ArrowClosed,

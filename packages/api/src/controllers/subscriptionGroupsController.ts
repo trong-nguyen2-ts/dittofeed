@@ -15,7 +15,7 @@ import {
   EmptyResponse,
   SavedSubscriptionGroupResource,
   SubscriptionChange,
-  SubscriptionGroupResource,
+  SubscriptionGroupUpsertValidationError,
   UpsertSubscriptionGroupAssignmentsRequest,
   UpsertSubscriptionGroupResource,
   UserUploadRow,
@@ -37,7 +37,7 @@ import {
 import { schemaValidate } from "isomorphic-lib/src/resultHandling/schemaValidation";
 import { err, ok } from "neverthrow";
 import { omit } from "remeda";
-import { v4 as uuid, validate as validateUuid } from "uuid";
+import { v4 as uuid } from "uuid";
 
 import { CsvParseResult } from "../types";
 
@@ -54,21 +54,14 @@ export default async function subscriptionGroupsController(
         body: UpsertSubscriptionGroupResource,
         response: {
           200: SavedSubscriptionGroupResource,
-          400: CsvUploadValidationError,
+          400: SubscriptionGroupUpsertValidationError,
         },
       },
     },
     async (request, reply) => {
-      if (request.body.id && !validateUuid(request.body.id)) {
-        return reply.status(400).send({
-          message: "Invalid subscription group id, must be a valid v4 UUID",
-        });
-      }
       const result = await upsertSubscriptionGroup(request.body);
       if (result.isErr()) {
-        return reply.status(400).send({
-          message: result.error.message,
-        });
+        return reply.status(400).send(result.error);
       }
       const resource = subscriptionGroupToResource(result.value);
       return reply.status(200).send(resource);
@@ -118,6 +111,7 @@ export default async function subscriptionGroupsController(
       const subscriptionGroupId = request.headers[SUBSRIPTION_GROUP_ID_HEADER];
 
       // Parse the CSV stream into a JavaScript object with an array of rows
+      // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
       const rows: CsvParseResult = await new Promise<CsvParseResult>(
         (resolve) => {
           const parsingErrors: UserUploadRowErrors[] = [];
@@ -219,11 +213,31 @@ export default async function subscriptionGroupsController(
       for (const row of rows.value) {
         const userIds = missingUserIdsByEmail[row.email];
         const userId =
+          // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
           (row.id as string | undefined) ??
           (userIds?.length ? userIds[0] : uuid());
 
         if (!userId) {
           continue;
+        }
+
+        // Handle action column
+        // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+        const actionValue = (row as Record<string, string>).action;
+        let subscriptionAction = SubscriptionChange.Subscribe; // default to subscribe
+
+        if (actionValue !== undefined && actionValue !== "") {
+          if (actionValue === "subscribe") {
+            subscriptionAction = SubscriptionChange.Subscribe;
+          } else if (actionValue === "unsubscribe") {
+            subscriptionAction = SubscriptionChange.Unsubscribe;
+          } else {
+            // Invalid action value
+            const errorResponse: CsvUploadValidationError = {
+              message: `Invalid action value: "${actionValue}". Must be "subscribe" or "unsubscribe".`,
+            };
+            return reply.status(400).send(errorResponse);
+          }
         }
 
         const identifyEvent: InsertUserEvent = {
@@ -232,7 +246,7 @@ export default async function subscriptionGroupsController(
             userId,
             timestamp,
             type: "identify",
-            traits: omit(row, ["id"]),
+            traits: omit(row, ["id", "action"]),
           }),
         };
 
@@ -240,7 +254,7 @@ export default async function subscriptionGroupsController(
           userId,
           currentTime,
           subscriptionGroupId,
-          action: SubscriptionChange.Subscribe,
+          action: subscriptionAction,
         });
 
         userEvents.push(trackEvent);
@@ -294,7 +308,7 @@ export default async function subscriptionGroupsController(
           workspaceId: WorkspaceId,
         }),
         response: {
-          200: Type.Array(SubscriptionGroupResource),
+          200: Type.Array(SavedSubscriptionGroupResource),
         },
       },
     },

@@ -9,15 +9,11 @@ import {
 import { addInitialStateToProps } from "../lib/addInitialStateToProps";
 import { requestContext } from "../lib/requestContext";
 import { PropsWithInitialState } from "../lib/types";
-import { getDeliveriesData } from "./deliveries/getDeliveriesData";
 
 export const getServerSideProps: GetServerSideProps<PropsWithInitialState> =
-  requestContext(async (ctx, dfContext) => {
+  requestContext(async (_ctx, dfContext) => {
     return {
       props: addInitialStateToProps({
-        serverInitialState: await getDeliveriesData({
-          workspaceId: dfContext.workspace.id,
-        }),
         props: {},
         dfContext,
       }),
@@ -27,7 +23,7 @@ export const getServerSideProps: GetServerSideProps<PropsWithInitialState> =
 export default function DeliveriesPage() {
   return (
     <DashboardContent>
-      <Box sx={{ width: "100%", p: 4, height: "100%" }}>
+      <Box sx={{ width: "100%", pr: 2, pl: 2, pt: 1, height: "100%" }}>
         <DeliveriesTableV2 {...DEFAULT_DELIVERIES_TABLE_V2_PROPS} />
       </Box>
     </DashboardContent>

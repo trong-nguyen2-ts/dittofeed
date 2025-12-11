@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, SQL } from "drizzle-orm";
 import {
   SecretNames,
   SUBSCRIPTION_MANAGEMENT_PAGE,
@@ -6,13 +6,21 @@ import {
 import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 import { err, ok, Result } from "neverthrow";
 import path from "path";
+import { PostgresError } from "pg-error-enum";
 import * as R from "remeda";
 import { URL } from "url";
 import { v4 as uuid, validate as validateUuid } from "uuid";
 
 import config from "./config";
 import { generateSecureHash, generateSecureKey } from "./crypto";
-import { db, insert, upsert } from "./db";
+import {
+  db,
+  insert,
+  QueryError,
+  TxQueryError,
+  txQueryResult,
+  upsert,
+} from "./db";
 import {
   secret as dbSecret,
   segment as dbSegment,
@@ -20,8 +28,7 @@ import {
 } from "./db/schema";
 import logger from "./logger";
 import {
-  findAllSegmentAssignments,
-  findAllSegmentAssignmentsByIds,
+  findAllSegmentAssignmentsByIdsForUsers,
   insertSegmentAssignments,
   SegmentBulkUpsertItem,
 } from "./segments";
@@ -37,6 +44,8 @@ import {
   SubscriptionChangeEvent,
   SubscriptionGroup,
   SubscriptionGroupType,
+  SubscriptionGroupUpsertValidationError,
+  SubscriptionGroupUpsertValidationErrorType,
   SubscriptionParams,
   UpsertSubscriptionGroupResource,
   UserSubscriptionAction,
@@ -93,46 +102,111 @@ export function getSubscriptionGroupDetails(
   };
 }
 
-export async function getSubscriptionGroupWithAssignment({
-  subscriptionGroupId,
-  userId,
+export async function getSubscriptionGroupsWithAssignments({
+  workspaceId,
+  subscriptionGroupIds: subscriptionGroupIdsUnsafe,
+  userIds,
 }: {
-  subscriptionGroupId: string;
-  userId: string;
-}): Promise<SubscriptionGroupWithAssignment | null> {
-  if (!validateUuid(subscriptionGroupId)) {
-    return null;
+  workspaceId: string;
+  subscriptionGroupIds?: string[];
+  userIds: string[];
+}): Promise<SubscriptionGroupWithAssignment[]> {
+  const subscriptionGroupIds = subscriptionGroupIdsUnsafe?.filter((id) =>
+    validateUuid(id),
+  );
+
+  if (userIds.length === 0) {
+    return [];
   }
-  const sg = await db().query.subscriptionGroup.findFirst({
-    where: eq(dbSubscriptionGroup.id, subscriptionGroupId),
+  const subscriptionGroups = await db().query.subscriptionGroup.findMany({
+    where: and(
+      eq(dbSubscriptionGroup.workspaceId, workspaceId),
+      subscriptionGroupIds
+        ? inArray(dbSubscriptionGroup.id, subscriptionGroupIds)
+        : undefined,
+    ),
     with: {
       segments: true,
     },
   });
-  if (!sg?.segments[0]) {
-    logger().error(
-      {
-        workspaceId: sg?.workspaceId,
-        subscriptionGroupId,
-        userId,
-      },
-      "No segment found for subscription group",
-    );
-    return null;
-  }
-  const segmentId = sg.segments[0].id;
-  const assignments = await findAllSegmentAssignmentsByIds({
-    workspaceId: sg.workspaceId,
-    segmentIds: [segmentId],
-    userId,
+
+  const segmentIds = subscriptionGroups.flatMap((sg) =>
+    sg.segments.map((s) => s.id),
+  );
+  // Use the efficient batch version
+  const assignmentsByUser = await findAllSegmentAssignmentsByIdsForUsers({
+    workspaceId,
+    segmentIds,
+    userIds,
   });
-  const value = assignments[0]?.inSegment ?? null;
-  return {
-    ...sg,
-    userId,
-    segmentId,
-    value,
-  };
+
+  return subscriptionGroups.flatMap((sg) => {
+    const segmentId = sg.segments[0]?.id;
+    if (!segmentId) {
+      logger().error(
+        {
+          workspaceId,
+          subscriptionGroupId: sg.id,
+          userIds,
+        },
+        "No segment found for subscription group",
+      );
+      return [];
+    }
+    return userIds.map((userId) => {
+      const assignments = assignmentsByUser[userId] ?? [];
+      const assignment = assignments.find((a) => a.segmentId === segmentId);
+      const value = assignment?.inSegment ?? null;
+      return {
+        ...sg,
+        userId,
+        segmentId,
+        value,
+      };
+    });
+  });
+}
+
+export async function getSubscriptionGroupWithAssignment({
+  subscriptionGroupId,
+  workspaceId,
+  userId,
+}: {
+  subscriptionGroupId: string;
+  workspaceId: string;
+  userId: string;
+}): Promise<SubscriptionGroupWithAssignment | null> {
+  const results = await getSubscriptionGroupsWithAssignments({
+    workspaceId,
+    subscriptionGroupIds: [subscriptionGroupId],
+    userIds: [userId],
+  });
+  return results[0] ?? null;
+}
+
+export function getSubscriptionGroupSegmentName(id: string) {
+  return `subscriptionGroup-${id}`;
+}
+
+function mapUpsertValidationError(
+  error: QueryError | TxQueryError,
+): SubscriptionGroupUpsertValidationError {
+  if (
+    error.code === PostgresError.UNIQUE_VIOLATION ||
+    error.code === PostgresError.FOREIGN_KEY_VIOLATION
+  ) {
+    logger().debug(
+      {
+        err: error,
+      },
+      "Unique constraint violation",
+    );
+    return {
+      type: SubscriptionGroupUpsertValidationErrorType.UniqueConstraintViolation,
+      message: "Subscription group with this name already exists",
+    };
+  }
+  throw error;
 }
 
 // TODO enable a channel type to specified
@@ -142,27 +216,108 @@ export async function upsertSubscriptionGroup({
   type,
   workspaceId,
   channel,
-}: UpsertSubscriptionGroupResource): Promise<Result<SubscriptionGroup, Error>> {
-  const sg = await db().transaction(async (tx) => {
-    const subscriptionGroup = await upsert({
-      table: dbSubscriptionGroup,
-      values: {
-        id,
-        name,
-        type,
-        channel,
-        workspaceId,
-      },
-      target: [dbSubscriptionGroup.id],
-      setWhere: eq(dbSubscriptionGroup.workspaceId, workspaceId),
-      tx,
-      set: {
-        name,
-        type,
-      },
-    }).then(unwrap);
+  createdAt,
+  updatedAt,
+}: UpsertSubscriptionGroupResource & {
+  // dates are used for deterministic testing
+  createdAt?: Date;
+  updatedAt?: Date;
+}): Promise<Result<SubscriptionGroup, SubscriptionGroupUpsertValidationError>> {
+  if (id && !validateUuid(id)) {
+    return err({
+      type: SubscriptionGroupUpsertValidationErrorType.IdError,
+      message: "Invalid subscription group id, must be a valid v4 UUID",
+    });
+  }
 
-    const segmentName = `subscriptionGroup-${id}`;
+  const txResult: Result<
+    SubscriptionGroup,
+    SubscriptionGroupUpsertValidationError
+  > = await db().transaction(async (tx) => {
+    const conditions: SQL[] = [
+      eq(dbSubscriptionGroup.workspaceId, workspaceId),
+    ];
+    if (id) {
+      conditions.push(eq(dbSubscriptionGroup.id, id));
+    } else if (name) {
+      conditions.push(eq(dbSubscriptionGroup.name, name));
+    }
+
+    const existingSubscriptionGroup =
+      await tx.query.subscriptionGroup.findFirst({
+        where: and(...conditions),
+      });
+
+    let subscriptionGroup: SubscriptionGroup;
+    if (!existingSubscriptionGroup) {
+      if (!name) {
+        return err({
+          type: SubscriptionGroupUpsertValidationErrorType.BadValues,
+          message: "Name is required when creating a subscription group",
+        });
+      }
+      const createResult = await txQueryResult(
+        tx
+          .insert(dbSubscriptionGroup)
+          .values({
+            id,
+            workspaceId,
+            name,
+            type,
+            channel,
+            createdAt,
+            updatedAt,
+          })
+          .returning(),
+      );
+      if (createResult.isErr()) {
+        return err(mapUpsertValidationError(createResult.error));
+      }
+      const createdSubscriptionGroup = createResult.value[0];
+      if (!createdSubscriptionGroup) {
+        logger().error(
+          {
+            workspaceId,
+            name,
+          },
+          "subscription group not found after creation",
+        );
+        throw new Error("subscription group not found after creation");
+      }
+      subscriptionGroup = createdSubscriptionGroup;
+    } else {
+      const updateResult = await txQueryResult(
+        tx
+          .update(dbSubscriptionGroup)
+          .set({
+            name,
+            type,
+            channel,
+            createdAt,
+            updatedAt,
+          })
+          .where(and(...conditions))
+          .returning(),
+      );
+      if (updateResult.isErr()) {
+        return err(mapUpsertValidationError(updateResult.error));
+      }
+      const updatedSubscriptionGroup = updateResult.value[0];
+      if (!updatedSubscriptionGroup) {
+        logger().error(
+          {
+            workspaceId,
+            subscriptionGroupId: existingSubscriptionGroup.id,
+          },
+          "subscription group not found after update",
+        );
+        throw new Error("subscription group not found after update");
+      }
+      subscriptionGroup = updatedSubscriptionGroup;
+    }
+
+    // Create the associated segment inside the transaction
+    const segmentName = getSubscriptionGroupSegmentName(subscriptionGroup.id);
     const segmentDefinition: SegmentDefinition = {
       entryNode: {
         type: SegmentNodeType.SubscriptionGroup,
@@ -180,19 +335,27 @@ export async function upsertSubscriptionGroup({
         definition: segmentDefinition,
         subscriptionGroupId: subscriptionGroup.id,
         resourceType: "Internal",
+        createdAt,
+        updatedAt,
       },
       target: [dbSegment.workspaceId, dbSegment.name],
       set: {
         name: segmentName,
         definition: segmentDefinition,
+        createdAt,
+        updatedAt,
       },
       tx,
     }).then(unwrap);
 
-    return subscriptionGroup;
+    return ok(subscriptionGroup);
   });
 
-  return ok(sg);
+  if (txResult.isErr()) {
+    return err(txResult.error);
+  }
+
+  return ok(txResult.value);
 }
 
 export function subscriptionGroupToResource(
@@ -249,6 +412,8 @@ export function generateSubscriptionChangeUrl({
   identifierKey,
   changedSubscription,
   subscriptionChange,
+  isPreview,
+  showAllChannels,
 }: {
   workspaceId: string;
   userId: string;
@@ -257,6 +422,8 @@ export function generateSubscriptionChangeUrl({
   identifierKey: string;
   changedSubscription?: string;
   subscriptionChange?: SubscriptionChange;
+  isPreview?: boolean;
+  showAllChannels?: boolean;
 }): string {
   const hash = generateSubscriptionHash({
     workspaceId,
@@ -276,6 +443,12 @@ export function generateSubscriptionChangeUrl({
     params.s = changedSubscription;
     params.sub =
       subscriptionChange === SubscriptionChange.Subscribe ? "1" : "0";
+  }
+  if (isPreview) {
+    params.isPreview = "true";
+  }
+  if (showAllChannels) {
+    params.showAllChannels = "true";
   }
   const url = new URL(config().dashboardUrl);
   url.pathname = path.join("/dashboard", SUBSCRIPTION_MANAGEMENT_PAGE);
@@ -352,44 +525,21 @@ export async function getUserSubscriptions({
   workspaceId,
   userId,
 }: GetUserSubscriptionsRequest): Promise<UserSubscriptionResource[]> {
-  const subscriptionGroups = await db().query.subscriptionGroup.findMany({
-    where: eq(dbSubscriptionGroup.workspaceId, workspaceId),
-    orderBy: (sg, { asc }) => [asc(sg.name)],
-    with: {
-      segments: true,
-    },
-  });
-  const segmentIds = subscriptionGroups.flatMap((sg) =>
-    sg.segments.map((s) => s.id),
-  );
-  const assignments = await findAllSegmentAssignments({
+  const groupWithAssignments = await getSubscriptionGroupsWithAssignments({
     workspaceId,
-    userId,
-    segmentIds,
+    userIds: [userId],
   });
-  const subscriptions: UserSubscriptionResource[] = [];
+  return groupWithAssignments.map((sg) => {
+    const details = getSubscriptionGroupDetails(sg);
+    const isSubscribed = inSubscriptionGroup(details);
 
-  for (const subscriptionGroup of subscriptionGroups) {
-    const segment = subscriptionGroup.segments[0];
-    if (!segment) {
-      logger().error(
-        { subscriptionGroup },
-        "No segment found for subscription group",
-      );
-      continue;
-    }
-    const inSegment = assignments[segment.id] === true;
-
-    const { id, name } = subscriptionGroup;
-
-    subscriptions.push({
-      id,
-      name,
-      isSubscribed: inSegment,
-    });
-  }
-
-  return subscriptions;
+    return {
+      name: sg.name,
+      id: sg.id,
+      channel: sg.channel,
+      isSubscribed,
+    };
+  });
 }
 
 /**

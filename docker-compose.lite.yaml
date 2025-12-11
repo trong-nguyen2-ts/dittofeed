@@ -19,7 +19,7 @@ x-backend-app-env: &backend-app-env
   DASHBOARD_API_BASE: ${DASHBOARD_API_BASE:-http://localhost:3000}
 services:
   lite:
-    image: dittofeed/dittofeed-lite:${IMAGE_TAG:-v0.21.0}
+    image: ${IMAGE_REPOSITORY:-dittofeed/dittofeed-lite}:${IMAGE_TAG:-v0.23.0}
     restart: always
     command: node --max-old-space-size=${LITE_MEM_LIMIT:-824} ./packages/lite/dist/scripts/startLite.js --workspace-name=${WORKSPACE_NAME:-Default}
     logging:
@@ -45,7 +45,7 @@ services:
       - dittofeed-network-lite
   # useful for upgrading dittofeed
   admin-cli:
-    image: dittofeed/dittofeed-admin-cli:${IMAGE_TAG:-v0.21.0}
+    image: dittofeed/dittofeed-admin-cli:${IMAGE_TAG:-v0.23.0}
     entrypoint: []
     profiles: ["admin-cli"]
     command: tail -f /dev/null
@@ -77,6 +77,9 @@ services:
       - POSTGRES_PWD=${DATABASE_PASSWORD:-password}
       - POSTGRES_SEEDS=${DATABASE_HOST:-postgres}
       - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/prod.yaml
+    # README: To add local env variables uncomment the following line and add a .env file in the root directory
+    # env_file:
+    #   - .env
     image: temporalio/auto-setup:${TEMPORAL_VERSION:-1.22.4}
     labels:
       kompose.volume.type: configMap
@@ -118,14 +121,14 @@ services:
     networks:
       - dittofeed-network-lite
   clickhouse-server:
-    image: clickhouse/clickhouse-server:23.8.8.20-alpine
+    image: clickhouse/clickhouse-server:24.12.6.70-alpine
     restart: always
     logging:
       driver: "local"
     deploy:
       resources:
         limits:
-          memory: ${CLICKHOUSE_CONTAINER_MEM_LIMIT:-1024}m
+          memory: ${CLICKHOUSE_CONTAINER_MEM_LIMIT:-2048}m
     environment:
       <<: *clickhouse-credentials
     ports:

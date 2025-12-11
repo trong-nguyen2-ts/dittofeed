@@ -22,6 +22,16 @@ export const dbBroadcastStatus = pgEnum("DBBroadcastStatus", [
   "InProgress",
   "Triggered",
 ]);
+export const dbBroadcastStatusV2 = pgEnum("DBBroadcastStatusV2", [
+  "Draft",
+  "Scheduled",
+  "Running",
+  "Paused",
+  "Completed",
+  "Cancelled",
+  "Failed",
+]);
+export const dbBroadcastVersion = pgEnum("DBBroadcastVersion", ["V1", "V2"]);
 export const dbChannelType = pgEnum("DBChannelType", [
   "Email",
   "MobilePush",
@@ -48,6 +58,10 @@ export const dbSubscriptionGroupType = pgEnum("DBSubscriptionGroupType", [
   "OptIn",
   "OptOut",
 ]);
+export const DBWorkspaceOccupantType = pgEnum("DBWorkspaceOccupantType", [
+  "WorkspaceMember",
+  "ChildWorkspaceOccupant",
+]);
 export const journeyStatus = pgEnum("JourneyStatus", [
   "NotStarted",
   "Running",
@@ -58,6 +72,16 @@ export const segmentStatus = pgEnum("SegmentStatus", [
   "NotStarted",
   "Running",
   "Paused",
+]);
+export const userPropertyStatus = pgEnum("UserPropertyStatus", [
+  "NotStarted",
+  "Running",
+  "Paused",
+]);
+export const dbUserPropertyIndexType = pgEnum("DBUserPropertyIndexType", [
+  "String",
+  "Number",
+  "Date",
 ]);
 export const workspaceStatus = pgEnum("WorkspaceStatus", [
   "Active",
@@ -140,6 +164,7 @@ export const userProperty = pgTable(
     definitionUpdatedAt: timestamp({ precision: 3, mode: "date" })
       .defaultNow()
       .notNull(),
+    status: userPropertyStatus().default("Running").notNull(),
     exampleValue: text(),
   },
   (table) => [
@@ -362,7 +387,6 @@ export const broadcast = pgTable(
   {
     id: uuid().primaryKey().defaultRandom().notNull(),
     workspaceId: uuid().notNull(),
-    segmentId: uuid(),
     name: text().notNull(),
     triggeredAt: timestamp({ precision: 3, mode: "date" }),
     createdAt: timestamp({ precision: 3, mode: "date" }).defaultNow().notNull(),
@@ -372,7 +396,18 @@ export const broadcast = pgTable(
       .notNull(),
     journeyId: uuid(),
     messageTemplateId: uuid(),
-    status: dbBroadcastStatus().default("NotStarted").notNull(),
+    segmentId: uuid(),
+    subscriptionGroupId: uuid(),
+    status: dbBroadcastStatus().default("NotStarted"),
+    statusV2: dbBroadcastStatusV2().default("Draft"),
+    scheduledAt: timestamp({
+      precision: 3,
+      mode: "string",
+      withTimezone: false,
+    }),
+    version: dbBroadcastVersion().default("V1"),
+    archived: boolean().default(false).notNull(),
+    config: jsonb(),
   },
   (table) => [
     uniqueIndex("Broadcast_workspaceId_name_key").using(
@@ -1000,6 +1035,82 @@ export const componentConfiguration = pgTable(
       columns: [table.workspaceId],
       foreignColumns: [workspace.id],
       name: "ComponentConfiguration_workspaceId_fkey",
+    })
+      .onUpdate("cascade")
+      .onDelete("cascade"),
+  ],
+);
+
+export const workspaceOccupantSetting = pgTable(
+  "WorkspaceOccupantSetting",
+  {
+    workspaceId: uuid().notNull(),
+    name: text().notNull(),
+    workspaceOccupantId: text().notNull(),
+    occupantType: DBWorkspaceOccupantType().notNull(),
+    config: jsonb(),
+    secretId: uuid(),
+    createdAt: timestamp({ precision: 3, mode: "date" }).defaultNow().notNull(),
+    updatedAt: timestamp({ precision: 3, mode: "date" })
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex(
+      "WorkspaceOccupantSetting_workspaceId_occupantId_name_key",
+    ).using(
+      "btree",
+      table.workspaceId.asc().nullsLast().op("uuid_ops"),
+      table.workspaceOccupantId.asc().nullsLast().op("text_ops"),
+      table.name.asc().nullsLast().op("text_ops"),
+    ),
+    foreignKey({
+      columns: [table.workspaceId],
+      foreignColumns: [workspace.id],
+      name: "WorkspaceOccupantSetting_workspaceId_fkey",
+    })
+      .onUpdate("cascade")
+      .onDelete("cascade"),
+    foreignKey({
+      columns: [table.secretId],
+      foreignColumns: [secret.id],
+      name: "WorkspaceOccupantSetting_secretId_fkey",
+    })
+      .onUpdate("cascade")
+      .onDelete("set null"),
+  ],
+);
+
+export const userPropertyIndex = pgTable(
+  "UserPropertyIndex",
+  {
+    id: uuid().primaryKey().defaultRandom().notNull(),
+    workspaceId: uuid().notNull(),
+    userPropertyId: uuid().notNull(),
+    type: dbUserPropertyIndexType().notNull(),
+    createdAt: timestamp({ precision: 3, mode: "date" }).defaultNow().notNull(),
+    updatedAt: timestamp({ precision: 3, mode: "date" })
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("UserPropertyIndex_userPropertyId_key").using(
+      "btree",
+      table.userPropertyId.asc().nullsLast().op("uuid_ops"),
+    ),
+    foreignKey({
+      columns: [table.workspaceId],
+      foreignColumns: [workspace.id],
+      name: "UserPropertyIndex_workspaceId_fkey",
+    })
+      .onUpdate("cascade")
+      .onDelete("cascade"),
+    foreignKey({
+      columns: [table.userPropertyId],
+      foreignColumns: [userProperty.id],
+      name: "UserPropertyIndex_userPropertyId_fkey",
     })
       .onUpdate("cascade")
       .onDelete("cascade"),

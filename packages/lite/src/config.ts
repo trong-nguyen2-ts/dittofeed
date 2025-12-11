@@ -1,6 +1,6 @@
 import { Static, Type } from "@sinclair/typebox";
 import { loadConfig, setConfigOnEnv } from "backend-lib/src/config/loader";
-import { NodeEnv } from "backend-lib/src/types";
+import { BoolStr, NodeEnv } from "backend-lib/src/types";
 import { Overwrite } from "utility-types";
 
 const RawConfigProps = {
@@ -12,7 +12,10 @@ const RawConfigProps = {
     }),
   ),
   host: Type.Optional(Type.String()),
+  // TS custom: mode allows more flexibility (api, worker, or all)
   mode: Type.Optional(Type.String({ default: "all" })),
+  // Upstream: enableWorker flag for backward compatibility
+  enableWorker: Type.Optional(BoolStr),
 };
 
 // Structure of application config.
@@ -28,11 +31,22 @@ export type Config = Overwrite<
     host: string;
     port: number;
     mode: string;
+    enableWorker: boolean;
   }
 >;
 function parseRawConfig(raw: RawConfig): Config {
   const nodeEnv = raw.nodeEnv ?? "development";
   const port = Number(raw.port);
+
+  // Default mode is "all", but can be overridden by enableWorker flag
+  let mode = raw.mode ?? "all";
+  let enableWorker = raw.enableWorker !== "false";
+
+  // If enableWorker is explicitly set to false, adjust mode
+  if (raw.enableWorker === "false" && !raw.mode) {
+    mode = "api";
+    enableWorker = false;
+  }
 
   return {
     ...raw,
@@ -40,7 +54,8 @@ function parseRawConfig(raw: RawConfig): Config {
     nodeEnv,
     host: raw.host ?? (nodeEnv === "development" ? "localhost" : "0.0.0.0"),
     port: Number.isNaN(port) ? 3000 : port,
-    mode: raw.mode ?? "all",
+    mode,
+    enableWorker,
   };
 }
 

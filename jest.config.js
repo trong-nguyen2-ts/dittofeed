@@ -25,7 +25,7 @@ const config = {
         "^.+\\.tsx?$": [
           "ts-jest",
           {
-            tsconfig: "<rootDir>/packages/backend-lib/tsconfig.jest.json",
+            tsconfig: "<rootDir>/packages/backend-lib/tsconfig.json",
           },
         ],
       },
@@ -34,6 +34,13 @@ const config = {
       ...BASE_CONFIG,
       displayName: "dashboard",
       roots: ["<rootDir>/packages/dashboard/src"],
+      globalTeardown: "<rootDir>/packages/backend-lib/test/globalTeardown.ts",
+      globalSetup: "<rootDir>/packages/backend-lib/test/globalSetup.ts",
+      setupFilesAfterEnv: [
+        "<rootDir>/packages/backend-lib/test/setup.ts",
+        "<rootDir>/packages/dashboard/test/setup.ts",
+        "jest-expect-message",
+      ],
       moduleNameMapper: {
         "\\.css$": "<rootDir>/packages/dashboard/test/__mocks__/styleMock.ts",
       },
@@ -41,7 +48,7 @@ const config = {
         "^.+\\.tsx?$": [
           "ts-jest",
           {
-            tsconfig: "<rootDir>/packages/dashboard/tsconfig.jest.json",
+            tsconfig: "<rootDir>/packages/dashboard/tsconfig.json",
           },
         ],
       },
@@ -60,20 +67,20 @@ const config = {
         "^.+\\.tsx?$": [
           "ts-jest",
           {
-            tsconfig: "<rootDir>/packages/api/tsconfig.jest.json",
+            tsconfig: "<rootDir>/packages/api/tsconfig.json",
           },
         ],
       },
     },
     {
       ...BASE_CONFIG,
-      displayName: "isomorphic-lib",
-      roots: ["<rootDir>/packages/isomorphic-lib/src"],
+      displayName: "emailo",
+      roots: ["<rootDir>/packages/emailo/src"],
       transform: {
         "^.+\\.tsx?$": [
           "ts-jest",
           {
-            tsconfig: "<rootDir>/packages/dashboard/tsconfig.jest.json",
+            tsconfig: "<rootDir>/packages/emailo/tsconfig.json",
           },
         ],
       },

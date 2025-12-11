@@ -1,5 +1,5 @@
 import { Static, Type } from "@sinclair/typebox";
-import { parseInt } from "isomorphic-lib/src/numbers";
+import { parseFloat, parseInt } from "isomorphic-lib/src/numbers";
 import { hasProtocol } from "isomorphic-lib/src/urls";
 import queryString from "querystring";
 import { URL } from "url";
@@ -17,7 +17,7 @@ import {
 } from "./types";
 
 const BaseRawConfigProps = {
-  // original config
+  useGlobalComputedProperties: Type.Optional(BoolStr),
   databaseUrl: Type.Optional(Type.String()),
   databaseUser: Type.Optional(Type.String()),
   databasePassword: Type.Optional(Type.String()),
@@ -27,6 +27,9 @@ const BaseRawConfigProps = {
   databaseName: Type.Optional(Type.String()),
   writeMode: Type.Optional(WriteMode),
   temporalAddress: Type.Optional(Type.String()),
+  temporalConnectionTimeout: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
   clickhouseHost: Type.String(),
   clickhouseProtocol: Type.Optional(Type.String()),
   clickhouseDatabase: Type.Optional(Type.String()),
@@ -35,6 +38,7 @@ const BaseRawConfigProps = {
   kafkaBrokers: Type.Optional(Type.String()),
   kafkaUsername: Type.Optional(Type.String()),
   kafkaPassword: Type.Optional(Type.String()),
+  kafkaEnableAdminSasl: Type.Optional(BoolStr),
   kafkaSsl: Type.Optional(BoolStr),
   kafkaSaslMechanism: Type.Optional(KafkaSaslMechanism),
   kafkaUserEventsPartitions: Type.Optional(Type.String()),
@@ -88,6 +92,9 @@ const BaseRawConfigProps = {
   computePropertiesAttempts: Type.Optional(
     Type.String({ format: "naturalNumber" }),
   ),
+  computePropertiesJitterMs: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
   secretKey: Type.Optional(Type.String()),
   password: Type.Optional(Type.String()),
   computePropertiesWorkflowTaskTimeout: Type.Optional(
@@ -98,11 +105,14 @@ const BaseRawConfigProps = {
   openIdClientSecret: Type.Optional(Type.String()),
   allowedOrigins: Type.Optional(Type.String()),
   blobStorageEndpoint: Type.Optional(Type.String()),
+  blobStorageInternalEndpoint: Type.Optional(Type.String()),
   blobStorageAccessKeyId: Type.Optional(Type.String()),
   blobStorageSecretAccessKey: Type.Optional(Type.String()),
   blobStorageBucket: Type.Optional(Type.String()),
   enableBlobStorage: Type.Optional(BoolStr),
   blobStorageRegion: Type.Optional(Type.String()),
+  // Enable cold storage behavior (store on pause/tombstone, restore on resume/activate)
+  enableColdStorage: Type.Optional(BoolStr),
   exportLogsHyperDx: Type.Optional(BoolStr),
   hyperDxApiKey: Type.Optional(Type.String()),
   dittofeedTelemetryDisabled: Type.Optional(BoolStr),
@@ -117,14 +127,56 @@ const BaseRawConfigProps = {
   computePropertiesQueueCapacity: Type.Optional(
     Type.String({ format: "naturalNumber" }),
   ),
+  computePropertiesBatchThreshold: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
   computedPropertiesActivityTaskQueue: Type.Optional(Type.String()),
   computePropertiesSchedulerInterval: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  computePropertiesSchedulerQueueRestartDelay: Type.Optional(
     Type.String({ format: "naturalNumber" }),
   ),
   overrideDir: Type.Optional(Type.String()),
   enableAdditionalDashboardSettings: Type.Optional(BoolStr),
   additionalDashboardSettingsPath: Type.Optional(Type.String()),
   additionalDashboardSettingsTitle: Type.Optional(Type.String()),
+  gmailClientId: Type.Optional(Type.String()),
+  gmailClientSecret: Type.Optional(Type.String()),
+  clickhouseComputePropertiesRequestTimeout: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  clickhouseComputePropertiesMaxExecutionTime: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  // Cold storage ClickHouse operation timeouts
+  clickhouseColdStorageRequestTimeout: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  clickhouseColdStorageMaxExecutionTime: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  clickhouseMaxBytesRatioBeforeExternalGroupBy: Type.Optional(
+    Type.String({ format: "float" }),
+  ),
+  clickhouseMaxBytesBeforeExternalGroupBy: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  computePropertiesSplit: Type.Optional(BoolStr),
+  computePropertiesTimeout: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  waitForComputePropertiesBaseDelayMs: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  waitForComputePropertiesMaxAttempts: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  // OpenTelemetry metrics export interval (milliseconds)
+  metricsExportIntervalMs: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  batchChunkSize: Type.Optional(Type.String({ format: "naturalNumber" })),
 
   // TS custom config
   clickhouseClientRequestTimeout: Type.Optional(Type.String({ format: "naturalNumber" })),
@@ -195,10 +247,12 @@ export type Config = Overwrite<
   RawConfig,
   {
     allowedOrigins: string[];
+    assignmentSequentialConsistency: boolean;
     authMode: AuthMode;
     blobStorageAccessKeyId: string;
     blobStorageBucket: string;
     blobStorageEndpoint: string;
+    blobStorageInternalEndpoint: string;
     blobStorageRegion: string;
     blobStorageSecretAccessKey: string;
     bootstrap: boolean;
@@ -207,20 +261,31 @@ export type Config = Overwrite<
     bootstrapWorker: boolean;
     clickhouseDatabase: string;
     clickhouseHost: string;
+    computedPropertiesActivityTaskQueue: string;
+    computedPropertiesTaskQueue: string;
+    computedPropertiesTopicName: string;
     computePropertiesAttempts: number;
     computePropertiesInterval: number;
+    computePropertiesJitterMs: number;
+    computePropertiesQueueCapacity: number;
+    computePropertiesQueueConcurrency: number;
+    computePropertiesSchedulerInterval: number;
+    computePropertiesSchedulerQueueRestartDelay: number;
     computePropertiesWorkflowTaskTimeout: number;
-    computedPropertiesTopicName: string;
     dashboardUrl: string;
-    databaseUrl: string;
     databaseParams: Record<string, string>;
+    databaseUrl: string;
     dittofeedTelemetryDisabled: boolean;
+    enableAdditionalDashboardSettings: boolean;
     enableBlobStorage: boolean;
     enableMobilePush: boolean;
     enableSourceControl: boolean;
     exportLogsHyperDx: boolean;
+    enableColdStorage: boolean;
+    globalCronTaskQueue: string;
     googleOps: boolean;
     kafkaBrokers: string[];
+    kafkaEnableAdminSasl: boolean;
     kafkaSaslMechanism: KafkaSaslMechanism;
     kafkaSsl: boolean;
     kafkaUserEventsPartitions: number;
@@ -238,17 +303,23 @@ export type Config = Overwrite<
     startOtel: boolean;
     temporalAddress: string;
     temporalNamespace: string;
+    temporalConnectionTimeout?: number;
     trackDashboard: boolean;
+    useGlobalComputedProperties?: boolean;
     userEventsTopicName: string;
     writeMode: WriteMode;
-    globalCronTaskQueue: string;
-    computedPropertiesTaskQueue: string;
-    computedPropertiesActivityTaskQueue: string;
-    assignmentSequentialConsistency: boolean;
-    computePropertiesQueueConcurrency: number;
-    computePropertiesQueueCapacity: number;
-    computePropertiesSchedulerInterval: number;
-    enableAdditionalDashboardSettings: boolean;
+    clickhouseComputePropertiesRequestTimeout?: number;
+    clickhouseComputePropertiesMaxExecutionTime?: number;
+    clickhouseMaxBytesRatioBeforeExternalGroupBy?: number;
+    computePropertiesSplit: boolean;
+    computePropertiesTimeout: number;
+    waitForComputePropertiesBaseDelayMs: number;
+    waitForComputePropertiesMaxAttempts: number;
+    metricsExportIntervalMs: number;
+    batchChunkSize: number;
+    // Cold storage timeouts (ms)
+    clickhouseColdStorageRequestTimeout?: number;
+    clickhouseColdStorageMaxExecutionTime?: number;
 
     // TS custom config
     clickhouseClientRequestTimeout?: number;
@@ -258,6 +329,21 @@ export type Config = Overwrite<
   defaultUserEventsTableVersion: string;
   database: string;
 };
+
+export const SECRETS = new Set<keyof Config>([
+  "databasePassword",
+  "clickhousePassword",
+  "kafkaPassword",
+  "hubspotClientSecret",
+  "secretKey",
+  "password",
+  "openIdClientSecret",
+  "blobStorageAccessKeyId",
+  "blobStorageSecretAccessKey",
+  "hyperDxApiKey",
+  "databaseUrl", // Contains password
+  "dashboardWriteKey", // Potentially sensitive
+]);
 
 const defaultDbParams: Record<string, string> = {
   connect_timeout: "60",
@@ -441,7 +527,16 @@ function parseRawConfig(rawConfig: RawConfig): Config {
   const computedPropertiesActivityTaskQueue =
     rawConfig.computedPropertiesActivityTaskQueue ??
     computedPropertiesTaskQueue;
+  const blobStorageEndpoint =
+    rawConfig.blobStorageEndpoint ?? "http://localhost:9010";
+  const blobStorageInternalEndpoint =
+    rawConfig.blobStorageInternalEndpoint ??
+    (nodeEnv === NodeEnvEnum.Development || nodeEnv === NodeEnvEnum.Test
+      ? "http://blob-storage:9000"
+      : blobStorageEndpoint);
 
+  const blobStorageBucket = rawConfig.blobStorageBucket ?? "dittofeed";
+  const enableColdStorage = rawConfig.enableColdStorage === "true";
   const parsedConfig: Config = {
     ...rawConfig,
     bootstrap: rawConfig.bootstrap === "true",
@@ -466,6 +561,10 @@ function parseRawConfig(rawConfig: RawConfig): Config {
     kafkaBrokers: rawConfig.kafkaBrokers
       ? rawConfig.kafkaBrokers.split(",")
       : ["localhost:9092"],
+    kafkaEnableAdminSasl:
+      rawConfig.kafkaEnableAdminSasl !== undefined
+        ? rawConfig.kafkaEnableAdminSasl === "true"
+        : !!(rawConfig.kafkaUsername && rawConfig.kafkaPassword),
     kafkaSsl: rawConfig.kafkaSsl === "true",
     kafkaSaslMechanism: rawConfig.kafkaSaslMechanism ?? "plain",
     kafkaUserEventsPartitions: parseToNumber({
@@ -483,6 +582,9 @@ function parseRawConfig(rawConfig: RawConfig): Config {
     userEventsTopicName:
       rawConfig.userEventsTopicName ?? "dittofeed-user-events",
     temporalNamespace: rawConfig.temporalNamespace ?? "default",
+    temporalConnectionTimeout: rawConfig.temporalConnectionTimeout
+      ? parseInt(rawConfig.temporalConnectionTimeout)
+      : undefined,
     // deprecated
     defaultUserEventsTableVersion:
       rawConfig.defaultUserEventsTableVersion ?? "",
@@ -516,6 +618,9 @@ function parseRawConfig(rawConfig: RawConfig): Config {
     computePropertiesInterval: rawConfig.computePropertiesInterval
       ? parseInt(rawConfig.computePropertiesInterval)
       : 120 * 1000,
+    computePropertiesJitterMs: rawConfig.computePropertiesJitterMs
+      ? parseInt(rawConfig.computePropertiesJitterMs)
+      : 0,
     signoutUrl:
       authMode === "single-tenant"
         ? "/api/public/single-tenant/signout"
@@ -534,12 +639,16 @@ function parseRawConfig(rawConfig: RawConfig): Config {
     sessionCookieSecure: rawConfig.sessionCookieSecure === "true",
     allowedOrigins: (rawConfig.allowedOrigins ?? dashboardUrl).split(","),
     enableBlobStorage: rawConfig.enableBlobStorage === "true",
-    blobStorageEndpoint:
-      rawConfig.blobStorageEndpoint ?? "http://localhost:9010",
+    // Gate cold storage behavior (default false)
+    enableColdStorage,
+    // Endpoint used by Node AWS SDK clients (host-accessible)
+    blobStorageEndpoint,
+    // Internal endpoint used by ClickHouse (container-accessible)
+    blobStorageInternalEndpoint,
     blobStorageAccessKeyId: rawConfig.blobStorageAccessKeyId ?? "admin",
     blobStorageSecretAccessKey:
       rawConfig.blobStorageSecretAccessKey ?? "password",
-    blobStorageBucket: rawConfig.blobStorageBucket ?? "dittofeed",
+    blobStorageBucket,
     blobStorageRegion: rawConfig.blobStorageRegion ?? "us-east-1",
     exportLogsHyperDx: rawConfig.exportLogsHyperDx === "true",
     dittofeedTelemetryDisabled:
@@ -562,8 +671,55 @@ function parseRawConfig(rawConfig: RawConfig): Config {
       rawConfig.computePropertiesSchedulerInterval
         ? parseInt(rawConfig.computePropertiesSchedulerInterval)
         : 10 * 1000,
+    computePropertiesSchedulerQueueRestartDelay:
+      rawConfig.computePropertiesSchedulerQueueRestartDelay
+        ? parseInt(rawConfig.computePropertiesSchedulerQueueRestartDelay)
+        : 30 * 1000,
     enableAdditionalDashboardSettings:
       rawConfig.enableAdditionalDashboardSettings === "true",
+    useGlobalComputedProperties:
+      rawConfig.useGlobalComputedProperties === undefined
+        ? undefined
+        : rawConfig.useGlobalComputedProperties !== "false",
+    clickhouseComputePropertiesRequestTimeout:
+      rawConfig.clickhouseComputePropertiesRequestTimeout
+        ? parseInt(rawConfig.clickhouseComputePropertiesRequestTimeout)
+        : 180000,
+    clickhouseComputePropertiesMaxExecutionTime:
+      rawConfig.clickhouseComputePropertiesMaxExecutionTime
+        ? parseInt(rawConfig.clickhouseComputePropertiesMaxExecutionTime)
+        : 180000,
+    // Default to 5 minutes for cold storage operations
+    clickhouseColdStorageRequestTimeout:
+      rawConfig.clickhouseColdStorageRequestTimeout
+        ? parseInt(rawConfig.clickhouseColdStorageRequestTimeout)
+        : 5 * 60 * 1000,
+    clickhouseColdStorageMaxExecutionTime:
+      rawConfig.clickhouseColdStorageMaxExecutionTime
+        ? parseInt(rawConfig.clickhouseColdStorageMaxExecutionTime)
+        : 5 * 60 * 1000,
+    clickhouseMaxBytesRatioBeforeExternalGroupBy:
+      rawConfig.clickhouseMaxBytesRatioBeforeExternalGroupBy
+        ? parseFloat(rawConfig.clickhouseMaxBytesRatioBeforeExternalGroupBy)
+        : undefined,
+    computePropertiesSplit: rawConfig.computePropertiesSplit === "true",
+    computePropertiesTimeout: rawConfig.computePropertiesTimeout
+      ? parseInt(rawConfig.computePropertiesTimeout)
+      : 5 * 60 * 1000,
+    waitForComputePropertiesBaseDelayMs:
+      rawConfig.waitForComputePropertiesBaseDelayMs
+        ? parseInt(rawConfig.waitForComputePropertiesBaseDelayMs)
+        : 10_000,
+    waitForComputePropertiesMaxAttempts:
+      rawConfig.waitForComputePropertiesMaxAttempts
+        ? parseInt(rawConfig.waitForComputePropertiesMaxAttempts)
+        : 5,
+    metricsExportIntervalMs: rawConfig.metricsExportIntervalMs
+      ? parseInt(rawConfig.metricsExportIntervalMs)
+      : 60 * 1000,
+    batchChunkSize: rawConfig.batchChunkSize
+      ? parseInt(rawConfig.batchChunkSize)
+      : 100,
 
     // TS custom config
     clickhouseClientRequestTimeout: rawConfig.clickhouseClientRequestTimeout

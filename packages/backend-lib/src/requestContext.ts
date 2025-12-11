@@ -1,5 +1,5 @@
 import { SpanStatusCode } from "@opentelemetry/api";
-import { and, eq, or } from "drizzle-orm";
+import { and, eq, inArray, or } from "drizzle-orm";
 import { IncomingHttpHeaders } from "http";
 import { assertUnreachable } from "isomorphic-lib/src/typeAssertions";
 import { err, ok } from "neverthrow";
@@ -22,13 +22,18 @@ import {
   OpenIdProfile,
   RequestContextErrorType,
   RequestContextResult,
+  Workspace,
   WorkspaceMember,
   WorkspaceMemberResource,
+  WorkspaceMemberRole,
   WorkspaceMemberRoleResource,
   WorkspaceResource,
   WorkspaceStatusDb,
   WorkspaceStatusDbEnum,
+  WorkspaceTypeApp,
+  WorkspaceTypeAppEnum,
 } from "./types";
+import { isProfileEmailVerified } from "./openIdProfile";
 
 export const SESSION_KEY = "df-session-key";
 
@@ -36,12 +41,14 @@ interface RolesWithWorkspace {
   workspace:
     | (WorkspaceResource & {
         status: WorkspaceStatusDb;
+        type: WorkspaceTypeApp;
+        parentWorkspaceId: string | null;
       })
     | null;
   memberRoles: WorkspaceMemberRoleResource[];
 }
 
-async function findAndCreateRoles(
+export async function findAndCreateRoles(
   member: WorkspaceMember,
 ): Promise<RolesWithWorkspace> {
   const domain = member.email?.split("@")[1];
@@ -96,10 +103,56 @@ async function findAndCreateRoles(
       roles.push(role);
     }
   }
+
   const workspaceById = workspaces.reduce((acc, w) => {
     acc.set(w.Workspace.id, w.Workspace);
     return acc;
-  }, new Map<string, WorkspaceResource>());
+  }, new Map<string, Workspace>());
+
+  const parentWorkspaces = workspaces.filter(
+    (w) => w.Workspace.type === WorkspaceTypeAppEnum.Parent,
+  );
+
+  if (parentWorkspaces.length !== 0) {
+    const childWorkspaces = await db()
+      .select()
+      .from(dbWorkspace)
+      .where(
+        and(
+          inArray(
+            dbWorkspace.parentWorkspaceId,
+            parentWorkspaces.map((w) => w.Workspace.id),
+          ),
+          eq(dbWorkspace.status, WorkspaceStatusDbEnum.Active),
+          eq(dbWorkspace.type, WorkspaceTypeAppEnum.Child),
+        ),
+      );
+
+    const existingRolesByWorkspaceId = roles.reduce((acc, r) => {
+      acc.set(r.workspaceId, r);
+      return acc;
+    }, new Map<string, WorkspaceMemberRole>());
+
+    for (const childWorkspace of childWorkspaces) {
+      if (
+        existingRolesByWorkspaceId.has(childWorkspace.id) ||
+        !childWorkspace.parentWorkspaceId
+      ) {
+        continue;
+      }
+      const parentRole = existingRolesByWorkspaceId.get(
+        childWorkspace.parentWorkspaceId,
+      );
+      if (!parentRole) {
+        continue;
+      }
+      workspaceById.set(childWorkspace.id, childWorkspace);
+      roles.push({
+        ...parentRole,
+        workspaceId: childWorkspace.id,
+      });
+    }
+  }
 
   const memberRoles = roles.flatMap((r) => {
     const workspace = workspaceById.get(r.workspaceId);
@@ -119,9 +172,7 @@ async function findAndCreateRoles(
     const lastWorkspaceRole = roles.find(
       (r) => r.workspaceId === member.lastWorkspaceId,
     );
-    const workspace = workspaces.find(
-      (w) => w.Workspace.id === member.lastWorkspaceId,
-    )?.Workspace;
+    const workspace = workspaceById.get(member.lastWorkspaceId);
     if (lastWorkspaceRole && workspace) {
       return { memberRoles, workspace };
     }
@@ -141,9 +192,7 @@ async function findAndCreateRoles(
       workspace: null,
     };
   }
-  const workspace = workspaces.find(
-    (w) => w.Workspace.id === role.workspaceId,
-  )?.Workspace;
+  const workspace = workspaceById.get(role.workspaceId);
 
   if (!workspace) {
     logger().debug(
@@ -186,7 +235,7 @@ export async function getMultiTenantRequestContext({
   } else {
     if (!authorizationToken) {
       return err({
-        type: RequestContextErrorType.ApplicationError,
+        type: RequestContextErrorType.NotAuthenticated,
         message: "authorizationToken is missing",
       });
     }
@@ -202,9 +251,10 @@ export async function getMultiTenantRequestContext({
   }
 
   // eslint-disable-next-line @typescript-eslint/naming-convention
-  const { sub, email, picture, email_verified, name, nickname } = profile;
+  const { sub, email, picture, name, nickname } = profile;
+  const emailVerified = isProfileEmailVerified(profile);
 
-  if (!email_verified) {
+  if (!emailVerified) {
     return err({
       type: RequestContextErrorType.EmailNotVerified,
       email,
@@ -235,7 +285,7 @@ export async function getMultiTenantRequestContext({
   let member: WorkspaceMember;
   if (
     !existingMember ||
-    existingMember.emailVerified !== email_verified ||
+    existingMember.emailVerified !== emailVerified ||
     existingMember.image !== picture
   ) {
     const [updatedMember] = await db()
@@ -243,7 +293,7 @@ export async function getMultiTenantRequestContext({
       .values({
         id: existingMember?.id,
         email,
-        emailVerified: email_verified,
+        emailVerified,
         image: picture,
         name,
         nickname,
@@ -253,7 +303,7 @@ export async function getMultiTenantRequestContext({
           ? [dbWorkspaceMember.id]
           : [dbWorkspaceMember.email],
         set: {
-          emailVerified: email_verified,
+          emailVerified,
           image: picture,
           name,
           nickname,
@@ -263,7 +313,7 @@ export async function getMultiTenantRequestContext({
     if (!updatedMember) {
       logger().error("Failed to update member", {
         email,
-        email_verified,
+        emailVerified,
         picture,
         name,
         nickname,
@@ -324,7 +374,12 @@ export async function getMultiTenantRequestContext({
 
   return ok({
     member: memberResouce,
-    workspace,
+    workspace: {
+      id: workspace.id,
+      name: workspace.name,
+      type: workspace.type,
+      parentWorkspaceId: workspace.parentWorkspaceId ?? undefined,
+    },
     memberRoles,
   });
 }
@@ -341,6 +396,7 @@ async function getAnonymousRequestContext(): Promise<RequestContextResult> {
     workspace: {
       id: workspace.id,
       name: workspace.name,
+      type: workspace.type,
     },
     member: {
       id: "anonymous",

@@ -1,30 +1,32 @@
 import { TypeBoxTypeProvider } from "@fastify/type-provider-typebox";
 import { db } from "backend-lib/src/db";
 import * as schema from "backend-lib/src/db/schema";
+import { deleteMessageTemplate } from "backend-lib/src/journeys";
 import { renderLiquid, RenderLiquidOptions } from "backend-lib/src/liquid";
 import logger from "backend-lib/src/logger";
 import {
+  batchMessageUsers,
   enrichMessageTemplate,
-  sendMessage,
-  SendMessageParameters,
+  testTemplate,
   upsertMessageTemplate,
 } from "backend-lib/src/messaging";
-import { defaultEmailDefinition } from "backend-lib/src/messaging/email";
-import { defaultSmsDefinition } from "backend-lib/src/messaging/sms";
-import { DEFAULT_WEBHOOK_DEFINITION } from "backend-lib/src/messaging/webhook";
 import { Secret } from "backend-lib/src/types";
 import { randomUUID } from "crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, SQL } from "drizzle-orm";
 import { toMjml } from "emailo/src/toMjml";
 import { FastifyInstance } from "fastify";
 import { CHANNEL_IDENTIFIERS } from "isomorphic-lib/src/channels";
 import { SecretNames } from "isomorphic-lib/src/constants";
+import { defaultEmailDefinition } from "isomorphic-lib/src/email";
 import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 import { schemaValidateWithErr } from "isomorphic-lib/src/resultHandling/schemaValidation";
+import { defaultSmsDefinition } from "isomorphic-lib/src/sms";
 import { assertUnreachable } from "isomorphic-lib/src/typeAssertions";
 import {
   BadWorkspaceConfigurationType,
   BaseMessageResponse,
+  BatchMessageUsersRequest,
+  BatchMessageUsersResponse,
   ChannelType,
   DefaultEmailProviderResource,
   DeleteMessageTemplateRequest,
@@ -48,10 +50,12 @@ import {
   RenderMessageTemplateResponseContent,
   RenderMessageTemplateType,
   ResetMessageTemplateResource,
+  SmsProviderType,
   UpsertMessageTemplateResource,
   UpsertMessageTemplateValidationError,
   WebhookSecret,
 } from "isomorphic-lib/src/types";
+import { DEFAULT_WEBHOOK_DEFINITION } from "isomorphic-lib/src/webhook";
 import * as R from "remeda";
 
 // eslint-disable-next-line @typescript-eslint/require-await
@@ -154,6 +158,7 @@ export default async function contentController(fastify: FastifyInstance) {
               value: rendered,
             };
           } catch (e) {
+            // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
             const err = e as Error;
             value = {
               type: JsonResultType.Err,
@@ -182,11 +187,19 @@ export default async function contentController(fastify: FastifyInstance) {
       },
     },
     async (request, reply) => {
+      const conditions: SQL[] = [
+        eq(schema.messageTemplate.workspaceId, request.query.workspaceId),
+      ];
+      if (request.query.ids) {
+        conditions.push(inArray(schema.messageTemplate.id, request.query.ids));
+      }
+      if (request.query.resourceType) {
+        conditions.push(
+          eq(schema.messageTemplate.resourceType, request.query.resourceType),
+        );
+      }
       const templateModels = await db().query.messageTemplate.findMany({
-        where: eq(
-          schema.messageTemplate.workspaceId,
-          request.query.workspaceId,
-        ),
+        where: and(...conditions),
       });
       const templates = templateModels.map((t) =>
         unwrap(enrichMessageTemplate(t)),
@@ -236,6 +249,7 @@ export default async function contentController(fastify: FastifyInstance) {
       switch (request.body.type) {
         case ChannelType.Email: {
           const defaultEmailProvider =
+            // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
             (await db().query.defaultEmailProvider.findFirst({
               where: eq(schema.defaultEmailProvider.workspaceId, workspaceId),
             })) as DefaultEmailProviderResource | null;
@@ -316,65 +330,7 @@ export default async function contentController(fastify: FastifyInstance) {
       },
     },
     async (request, reply) => {
-      const messageTags: MessageTags = {
-        ...(request.body.tags ?? {}),
-        messageId: request.body.tags?.messageId ?? randomUUID(),
-      };
-
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-      const userId = request.body.userProperties.id;
-      if (typeof userId === "string") {
-        messageTags.userId = userId;
-      }
-      const baseSendMessageParams: Omit<
-        SendMessageParameters,
-        "provider" | "channel"
-      > = {
-        workspaceId: request.body.workspaceId,
-        templateId: request.body.templateId,
-        userId: messageTags.userId ?? "test-user",
-        userPropertyAssignments: request.body.userProperties,
-        useDraft: true,
-        messageTags,
-      };
-      let sendMessageParams: SendMessageParameters;
-      switch (request.body.channel) {
-        case ChannelType.Email: {
-          sendMessageParams = {
-            ...baseSendMessageParams,
-            channel: request.body.channel,
-            providerOverride: request.body.provider,
-          };
-          break;
-        }
-        case ChannelType.Sms: {
-          sendMessageParams = {
-            ...baseSendMessageParams,
-            providerOverride: request.body.provider,
-            channel: request.body.channel,
-            disableCallback: true,
-          };
-          break;
-        }
-        case ChannelType.MobilePush: {
-          sendMessageParams = {
-            ...baseSendMessageParams,
-            provider: request.body.provider,
-            channel: request.body.channel,
-          };
-          break;
-        }
-        case ChannelType.Webhook: {
-          sendMessageParams = {
-            ...baseSendMessageParams,
-            channel: request.body.channel,
-          };
-          break;
-        }
-        default:
-          assertUnreachable(request.body);
-      }
-      const result = await sendMessage(sendMessageParams);
+      const result = await testTemplate(request.body);
       if (result.isOk()) {
         return reply.status(200).send({
           type: JsonResultType.Ok,
@@ -414,10 +370,67 @@ export default async function contentController(fastify: FastifyInstance) {
               },
             });
           }
+          case ChannelType.Sms: {
+            const { provider } = result.error.variant;
+            switch (provider.type) {
+              case SmsProviderType.Twilio: {
+                const suggestions: string[] = [];
+                if (provider.message) {
+                  suggestions.push(provider.message);
+                } else {
+                  suggestions.push(
+                    "Failed to send SMS via Twilio. Check your Twilio configuration and the phone number format.",
+                  );
+                }
+                return reply.status(200).send({
+                  type: JsonResultType.Err,
+                  err: {
+                    suggestions,
+                    responseData: provider.message,
+                  },
+                });
+              }
+              case SmsProviderType.SignalWire: {
+                const suggestions: string[] = [];
+                if (provider.status) {
+                  suggestions.push(
+                    `SignalWire responded with status: ${provider.status}`,
+                  );
+                }
+                if (provider.errorCode) {
+                  suggestions.push(`Error code: ${provider.errorCode}`);
+                }
+                if (provider.errorMessage) {
+                  suggestions.push(provider.errorMessage);
+                } else {
+                  suggestions.push(
+                    "Failed to send SMS via SignalWire. Verify phone number format and SignalWire project/token/space configuration.",
+                  );
+                }
+                return reply.status(200).send({
+                  type: JsonResultType.Err,
+                  err: {
+                    suggestions,
+                    responseData: JSON.stringify(provider, null, 2),
+                  },
+                });
+              }
+              default: {
+                return reply.status(200).send({
+                  type: JsonResultType.Err,
+                  err: {
+                    suggestions: [
+                      "Failed to send SMS. Check your SMS provider settings.",
+                    ],
+                  },
+                });
+              }
+            }
+          }
           case ChannelType.Email: {
             const { type } = result.error.variant.provider;
             switch (type) {
-              case EmailProviderType.Sendgrid: {
+              case EmailProviderType.SendGrid: {
                 const { body, status } = result.error.variant.provider;
                 const suggestions: string[] = [];
                 if (status) {
@@ -497,6 +510,9 @@ export default async function contentController(fastify: FastifyInstance) {
                   },
                 });
               }
+              case EmailProviderType.Gmail: {
+                throw new Error("Gmail is not supported in test mode");
+              }
               default: {
                 assertUnreachable(type);
               }
@@ -537,7 +553,12 @@ export default async function contentController(fastify: FastifyInstance) {
         }
       }
       logger().error(result.error, "Unexpected error sending test message");
-      return reply.status(500);
+      return reply.status(200).send({
+        type: JsonResultType.Err,
+        err: {
+          suggestions: ["Unexpected error sending test message"],
+        },
+      });
     },
   );
 
@@ -571,6 +592,65 @@ export default async function contentController(fastify: FastifyInstance) {
         return reply.status(404).send();
       }
       return reply.status(204).send();
+    },
+  );
+
+  fastify.withTypeProvider<TypeBoxTypeProvider>().delete(
+    "/templates/v2",
+    {
+      schema: {
+        description: "Delete a message template.",
+        tags: ["Content"],
+        querystring: DeleteMessageTemplateRequest,
+        response: {
+          204: EmptyResponse,
+          404: EmptyResponse,
+        },
+      },
+    },
+    async (request, reply) => {
+      const messageTemplate = await deleteMessageTemplate({
+        id: request.query.id,
+        workspaceId: request.query.workspaceId,
+        type: request.query.type,
+      });
+      if (!messageTemplate) {
+        return reply.status(404).send();
+      }
+      return reply.status(204).send();
+    },
+  );
+
+  fastify.withTypeProvider<TypeBoxTypeProvider>().post(
+    "/templates/batch-send",
+    {
+      schema: {
+        description:
+          "Send messages to a batch of users using a message template.",
+        tags: ["Content"],
+        body: BatchMessageUsersRequest,
+        response: {
+          200: BatchMessageUsersResponse,
+          500: BaseMessageResponse,
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const result = await batchMessageUsers(request.body);
+        return reply.status(200).send(result);
+      } catch (error) {
+        logger().error(
+          {
+            err: error,
+            workspaceId: request.body.workspaceId,
+          },
+          "Failed to send batch messages",
+        );
+        return reply.status(500).send({
+          message: "Failed to send batch messages",
+        });
+      }
     },
   );
 }

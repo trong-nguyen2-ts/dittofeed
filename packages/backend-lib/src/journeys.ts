@@ -1,10 +1,13 @@
 import { Row } from "@clickhouse/client";
+import { Counter } from "@opentelemetry/api";
 import { Type } from "@sinclair/typebox";
 import { and, eq, inArray, isNotNull, not, SQL } from "drizzle-orm";
 import { MESSAGE_EVENTS } from "isomorphic-lib/src/constants";
+import { doesEventNameMatch } from "isomorphic-lib/src/events";
 import {
   buildHeritageMap,
   getJourneyConstraintViolations,
+  getSubscribedSegments,
   HeritageMap,
 } from "isomorphic-lib/src/journeys";
 import { parseInt, round } from "isomorphic-lib/src/numbers";
@@ -24,19 +27,33 @@ import {
   query as chQuery,
   streamClickhouseQuery,
 } from "./clickhouse";
+import { enqueueRecompute } from "./computedProperties/computePropertiesWorkflow/lifecycle";
+import { QUEUE_ITEM_PRIORITIES } from "./constants";
 import { Db, db, insert, QueryError, queryResult } from "./db";
 import * as schema from "./db/schema";
+import {
+  segmentUpdateSignal,
+  userJourneyWorkflow,
+} from "./journeys/userWorkflow";
 import {
   startKeyedUserJourney,
   StartKeyedUserJourneyProps,
 } from "./journeys/userWorkflow/lifecycle";
 import logger from "./logger";
+import { getMeter } from "./openTelemetry";
 import { restartUserJourneyWorkflow } from "./restartUserJourneyWorkflow/lifecycle";
+import { findManySegmentResourcesSafe, findSegmentResource } from "./segments";
+import { getContext } from "./temporal/activity";
+import { getUserJourneyWorkflowId } from "./temporal/workflows";
 import {
   BaseMessageNodeStats,
   ChannelType,
+  ComputedAssignment,
+  DeleteJourneyRequest,
+  DeleteMessageTemplateRequest,
   EmailStats,
   EnrichedJourney,
+  HasStartedJourneyResource,
   InternalEventType,
   Journey,
   JourneyDefinition,
@@ -47,10 +64,16 @@ import {
   JourneyUpsertValidationError,
   JourneyUpsertValidationErrorType,
   MessageChannelStats,
+  MessageTemplate,
   NodeStatsType,
+  SavedHasStartedJourneyResource,
   SavedJourneyResource,
+  SegmentDefinition,
+  SegmentNodeType,
+  SegmentUpdate,
   SmsStats,
   UpsertJourneyResource,
+  WorkspaceQueueItemType,
 } from "./types";
 
 const { journey: dbJourney } = schema;
@@ -302,25 +325,24 @@ export async function getJourneyMessageStats({
         count(resolved_message_id) AS count
     FROM (
             SELECT
-                JSON_VALUE(message_raw, '$.properties.journeyId') AS journey_id,
-                JSON_VALUE(message_raw, '$.properties.nodeId') AS node_id,
-                JSON_VALUE(message_raw, '$.properties.runId') AS run_id,
+                journey_id,
+                JSON_VALUE(properties, '$.nodeId') AS node_id,
+                JSON_VALUE(properties, '$.runId') AS run_id,
                 if(
                     (
-                        JSON_VALUE(message_raw, '$.properties.messageId') AS property_message_id
+                        JSON_VALUE(properties, '$.messageId') AS property_message_id
                     ) != '',
                     property_message_id,
                     message_id
                 ) AS resolved_message_id,
                 argMax(event, event_time) as last_event
-            FROM user_events_v2
+            FROM internal_events
             WHERE
                 workspace_id = ${qb.addQueryValue(workspaceId, "String")}
                 AND journey_id in ${qb.addQueryValue(
                   journeyIds,
                   "Array(String)",
                 )}
-                AND (event_type = 'track')
                 AND (event in ${qb.addQueryValue(
                   MESSAGE_EVENTS,
                   "Array(String)",
@@ -473,20 +495,16 @@ export async function getJourneysStats({
 
   const query = `
     select
+        journey_id,
         JSON_VALUE(
-            message_raw,
-            '$.properties.journeyId'
-        ) journey_id,
-        JSON_VALUE(
-            message_raw,
-            '$.properties.nodeId'
+            properties,
+            '$.nodeId'
         ) node_id,
         uniq(message_id) as count
-    from user_events_v2
+    from internal_events
     where
         workspace_id = ${workspaceIdQuery}
         and journey_id in ${journeyIdsQuery}
-        and event_type = 'track'
         and event = 'DFJourneyNodeProcessed'
     group by journey_id, node_id
 `;
@@ -656,7 +674,7 @@ export async function getJourneysStats({
         }
         case JourneyNodeType.RateLimitNode:
           continue;
-        case JourneyNodeType.ExperimentSplitNode:
+        case JourneyNodeType.RandomCohortNode:
           continue;
         default:
           assertUnreachable(node);
@@ -672,8 +690,24 @@ const EVENT_TRIGGER_JOURNEY_CACHE = new NodeCache({
   checkperiod: 120,
 });
 
+let JOURNEY_TRIGGER_COUNTER: Counter | null = null;
+
+function journeyTriggerCounter() {
+  if (JOURNEY_TRIGGER_COUNTER !== null) {
+    return JOURNEY_TRIGGER_COUNTER;
+  }
+  const meter = getMeter();
+  const counter = meter.createCounter("journey_triggered_counter", {
+    description: "Counter for the number of keyed journeys triggered",
+    unit: "1",
+  });
+  JOURNEY_TRIGGER_COUNTER = counter;
+  return counter;
+}
+
 interface EventTriggerJourneyDetails {
   journeyId: string;
+  journeyName: string;
   event: string;
   definition: JourneyDefinition;
 }
@@ -730,17 +764,40 @@ export function triggerEventEntryJourneysFactory({
           event: journey.definition.entryNode.event,
           journeyId: journey.id,
           definition: journey.definition,
+          journeyName: journey.name,
         };
       });
       journeyCache.set(workspaceId, journeyDetails);
     }
 
     const starts: Promise<unknown>[] = journeyDetails.flatMap(
-      ({ journeyId, event: journeyEvent, definition }) => {
-        if (journeyEvent !== triggerEvent.event) {
+      ({ journeyId, journeyName, event: journeyEvent, definition }) => {
+        const isMatch = doesEventNameMatch({
+          pattern: journeyEvent,
+          event: triggerEvent.event,
+        });
+
+        if (!isMatch) {
           return [];
         }
 
+        const counter = journeyTriggerCounter();
+        if (definition.entryNode.type !== JourneyNodeType.EventEntryNode) {
+          logger().error(
+            {
+              workspaceId,
+              journeyId,
+            },
+            "can't trigger non-event entry journeys using event trigger",
+          );
+          return [];
+        }
+
+        counter.add(1, {
+          workspaceId,
+          journeyName,
+          entryType: definition.entryNode.type,
+        });
         return startKeyedJourneyImpl({
           workspaceId,
           userId,
@@ -752,6 +809,86 @@ export function triggerEventEntryJourneysFactory({
     );
     await Promise.all(starts);
   };
+}
+
+export async function triggerSegmentEntryJourney({
+  workspaceId,
+  segmentId,
+  segmentAssignment,
+  journey,
+}: {
+  workspaceId: string;
+  segmentId: string;
+  // TODO: remove this. Was servicing metric tag.
+  segmentDefinition: SegmentDefinition;
+  segmentAssignment: ComputedAssignment;
+  journey: HasStartedJourneyResource;
+}) {
+  if (journey.definition.entryNode.type !== JourneyNodeType.SegmentEntryNode) {
+    logger().error(
+      {
+        workspaceId,
+        journeyId: journey.id,
+      },
+      "can't trigger non-segment entry journeys using segment trigger",
+    );
+    return;
+  }
+
+  if (journey.definition.entryNode.segment !== segmentId) {
+    logger().error(
+      {
+        workspaceId,
+        journeyId: journey.id,
+      },
+      "can't trigger segment entry journeys with different segment",
+    );
+    return;
+  }
+  const segmentUpdate: SegmentUpdate = {
+    segmentId,
+    currentlyInSegment: Boolean(segmentAssignment.latest_segment_value),
+    segmentVersion: new Date(segmentAssignment.max_assigned_at).getTime(),
+    type: "segment",
+  };
+
+  if (!segmentUpdate.currentlyInSegment) {
+    return;
+  }
+
+  const { workflowClient } = getContext();
+  const { id: journeyId, definition } = journey;
+
+  const workflowId = getUserJourneyWorkflowId({
+    journeyId,
+    userId: segmentAssignment.user_id,
+  });
+
+  const userId = segmentAssignment.user_id;
+  const counter = journeyTriggerCounter();
+  counter.add(1, {
+    workspaceId,
+    journeyName: journey.name,
+    entryType: definition.entryNode.type,
+  });
+
+  await workflowClient.signalWithStart<
+    typeof userJourneyWorkflow,
+    [SegmentUpdate]
+  >(userJourneyWorkflow, {
+    taskQueue: "default",
+    workflowId,
+    args: [
+      {
+        journeyId,
+        definition,
+        workspaceId,
+        userId,
+      },
+    ],
+    signal: segmentUpdateSignal,
+    signalArgs: [segmentUpdate],
+  });
 }
 
 export async function updateJourney({
@@ -792,6 +929,12 @@ function mapUpsertValidationError(
     error.code === PostgresError.UNIQUE_VIOLATION ||
     error.code === PostgresError.FOREIGN_KEY_VIOLATION
   ) {
+    logger().debug(
+      {
+        err: error,
+      },
+      "Unique constraint violation",
+    );
     return {
       type: JourneyUpsertValidationErrorType.UniqueConstraintViolation,
       message: "Journey with this name already exists",
@@ -814,9 +957,18 @@ export async function upsertJourney(
   }
 
   if (definition) {
+    const segmentIds = getSubscribedSegments(definition);
+    const segments = (
+      await findManySegmentResourcesSafe({
+        workspaceId,
+        segmentIds: Array.from(segmentIds),
+      })
+    ).map(unwrap);
+
     const constraintViolations = getJourneyConstraintViolations({
       definition,
       newStatus: status,
+      segments,
     });
     if (constraintViolations.length > 0) {
       return err({
@@ -830,106 +982,163 @@ export async function upsertJourney(
   // explicitly set to null
   const nullableDraft = definition || draft === null ? null : draft;
 
-  const conditions: SQL[] = [];
-  if (id) {
-    conditions.push(eq(dbJourney.id, id));
-  }
-  if (workspaceId) {
-    conditions.push(eq(dbJourney.workspaceId, workspaceId));
-  }
+  const txResult: Result<
+    { journey: Journey; isNewlyRunningWithManualEntry?: boolean },
+    JourneyUpsertValidationError
+  > = await db().transaction(async (tx) => {
+    const conditions: SQL[] = [eq(dbJourney.workspaceId, workspaceId)];
+    if (id) {
+      conditions.push(eq(dbJourney.id, id));
+    } else if (name) {
+      conditions.push(eq(dbJourney.name, name));
+    }
 
-  const txResult: Result<Journey, JourneyUpsertValidationError> =
-    await db().transaction(async (tx) => {
-      const journey = await tx.query.journey.findFirst({
-        where: and(...conditions),
-      });
-      if (!journey) {
-        const created = (
-          await insert({
-            table: dbJourney,
-            tx,
-            doNothingOnConflict: true,
-            values: {
-              id,
-              workspaceId,
-              name,
-              definition,
-              draft: nullableDraft,
-              status,
-              canRunMultiple,
-            },
-          })
-        ).mapErr(mapUpsertValidationError);
-        return created.andThen((c) => {
-          if (!c) {
-            return err({
-              type: JourneyUpsertValidationErrorType.UniqueConstraintViolation,
-              message: "Journey with this name already exists",
-            } satisfies JourneyUpsertValidationError);
-          }
-          return ok(c);
-        });
-      }
-      if (
-        status === JourneyResourceStatusEnum.Paused &&
-        journey.status === JourneyResourceStatusEnum.NotStarted
-      ) {
+    const journey = await tx.query.journey.findFirst({
+      where: and(...conditions),
+    });
+    if (!journey) {
+      if (!name) {
         return err({
-          type: JourneyUpsertValidationErrorType.StatusTransitionError,
-          message: "Cannot pause a journey that has not been started",
+          type: JourneyUpsertValidationErrorType.BadValues,
+          message: "Name is required when creating a journey",
         });
       }
-
-      if (
-        status === JourneyResourceStatusEnum.NotStarted &&
-        journey.status !== JourneyResourceStatusEnum.NotStarted
-      ) {
-        return err({
-          type: JourneyUpsertValidationErrorType.StatusTransitionError,
-          message:
-            "Cannot set a journey to NotStarted if it has already been started. Pause the journey instead.",
-        });
-      }
-
-      let statusUpdatedAt: Date | undefined;
-      if (status && status !== journey.status) {
-        statusUpdatedAt = new Date();
-      }
-
-      const updateResult = await queryResult(
-        tx
-          .update(dbJourney)
-          .set({
+      const created = (
+        await insert({
+          table: dbJourney,
+          tx,
+          doNothingOnConflict: true,
+          values: {
+            id,
+            workspaceId,
             name,
             definition,
             draft: nullableDraft,
             status,
-            statusUpdatedAt,
             canRunMultiple,
-          })
-          .where(and(...conditions))
-          .returning(),
-      );
-      return updateResult
-        .map(([updated]) => {
-          if (!updated) {
-            logger().error(
-              {
-                workspaceId,
-                journeyId: journey.id,
-              },
-              "No result returned from update",
-            );
-            throw new Error("No result returned from update");
-          }
-          return updated;
+          },
         })
-        .mapErr(mapUpsertValidationError);
-    });
+      ).mapErr(mapUpsertValidationError);
+      let isNewlyRunningWithManualEntry = false;
+      if (
+        definition?.entryNode.type === JourneyNodeType.SegmentEntryNode &&
+        status === JourneyResourceStatusEnum.Running
+      ) {
+        const segment = await findSegmentResource({
+          workspaceId,
+          id: definition.entryNode.segment,
+        });
+
+        if (segment.isOk()) {
+          isNewlyRunningWithManualEntry =
+            segment.value?.definition.entryNode.type === SegmentNodeType.Manual;
+        } else {
+          logger().error(
+            {
+              workspaceId,
+              journeyName: name,
+              segmentId: definition.entryNode.segment,
+              err: segment.error,
+            },
+            "Failed parse segment",
+          );
+        }
+      }
+      return created.andThen((c) => {
+        if (!c) {
+          return err({
+            type: JourneyUpsertValidationErrorType.UniqueConstraintViolation,
+            message: "Journey with this name already exists",
+          } satisfies JourneyUpsertValidationError);
+        }
+        return ok({ journey: c, isNewlyRunningWithManualEntry });
+      });
+    }
+    if (
+      status === JourneyResourceStatusEnum.Paused &&
+      journey.status === JourneyResourceStatusEnum.NotStarted
+    ) {
+      return err({
+        type: JourneyUpsertValidationErrorType.StatusTransitionError,
+        message: "Cannot pause a journey that has not been started",
+      });
+    }
+
+    if (
+      status === JourneyResourceStatusEnum.NotStarted &&
+      journey.status !== JourneyResourceStatusEnum.NotStarted
+    ) {
+      return err({
+        type: JourneyUpsertValidationErrorType.StatusTransitionError,
+        message:
+          "Cannot set a journey to NotStarted if it has already been started. Pause the journey instead.",
+      });
+    }
+
+    let statusUpdatedAt: Date | undefined;
+    if (status && status !== journey.status) {
+      statusUpdatedAt = new Date();
+    }
+
+    const updateResult = await queryResult(
+      tx
+        .update(dbJourney)
+        .set({
+          name,
+          definition,
+          draft: nullableDraft,
+          status,
+          statusUpdatedAt,
+          canRunMultiple,
+        })
+        .where(and(...conditions))
+        .returning(),
+    );
+    const priorDefinition = schemaValidateWithErr(
+      journey.definition,
+      JourneyDefinition,
+    );
+
+    let isNewlyRunningWithManualEntry = false;
+    if (
+      definition?.entryNode.type === JourneyNodeType.SegmentEntryNode &&
+      status === JourneyResourceStatusEnum.Running &&
+      !(
+        journey.status === JourneyResourceStatusEnum.Running &&
+        priorDefinition.isOk() &&
+        priorDefinition.value.entryNode.type ===
+          JourneyNodeType.SegmentEntryNode
+      )
+    ) {
+      const segment = await findSegmentResource({
+        workspaceId,
+        id: definition.entryNode.segment,
+      });
+      if (segment.isOk()) {
+        isNewlyRunningWithManualEntry =
+          segment.value?.definition.entryNode.type === SegmentNodeType.Manual;
+      }
+    }
+    return updateResult
+      .map(([updated]) => {
+        if (!updated) {
+          logger().error(
+            {
+              workspaceId,
+              journeyId: journey.id,
+            },
+            "No result returned from update",
+          );
+          throw new Error("No result returned from update");
+        }
+        return { journey: updated, isNewlyRunningWithManualEntry };
+      })
+      .mapErr(mapUpsertValidationError);
+  });
   if (txResult.isErr()) {
     return err(txResult.error);
   }
-  const journey = txResult.value;
+  const { journey } = txResult.value;
   const journeyDefinitionResult = journey.definition
     ? schemaValidate(journey.definition, JourneyDefinition)
     : undefined;
@@ -1023,5 +1232,91 @@ export async function upsertJourney(
     };
   }
 
+  if (txResult.value.isNewlyRunningWithManualEntry) {
+    await enqueueRecompute({
+      items: [
+        {
+          type: WorkspaceQueueItemType.Journey,
+          workspaceId,
+          id: journey.id,
+          priority: QUEUE_ITEM_PRIORITIES.Explicit,
+        },
+      ],
+    });
+  }
   return ok(resource);
+}
+
+export async function deleteJourney(
+  params: DeleteJourneyRequest,
+): Promise<Journey | null> {
+  const { id, workspaceId } = params;
+  const [journey] = await db()
+    .delete(dbJourney)
+    .where(and(eq(dbJourney.id, id), eq(dbJourney.workspaceId, workspaceId)))
+    .returning();
+  if (!journey) {
+    return null;
+  }
+  return journey;
+}
+
+export async function findRunningJourneys({
+  workspaceId,
+  ids,
+}: {
+  workspaceId: string;
+  ids?: string[];
+}): Promise<SavedHasStartedJourneyResource[]> {
+  const journeys = await findManyJourneyResourcesSafe(
+    and(
+      eq(dbJourney.workspaceId, workspaceId),
+      eq(dbJourney.status, JourneyResourceStatusEnum.Running),
+      ...(ids ? [inArray(dbJourney.id, ids)] : []),
+    ),
+  );
+  return journeys.flatMap((j) => {
+    if (j.isErr()) {
+      logger().error({ err: j.error, workspaceId }, "failed to enrich journey");
+      return [];
+    }
+    if (j.value.status === "NotStarted") {
+      return [];
+    }
+    return j.value;
+  });
+}
+
+export async function findSubscribedRunningJourneysForSegment({
+  workspaceId,
+  segmentId,
+}: {
+  workspaceId: string;
+  segmentId: string;
+}): Promise<SavedHasStartedJourneyResource[]> {
+  const journeys = await findRunningJourneys({ workspaceId });
+
+  return journeys.filter((j) => {
+    const { definition } = j;
+    const subscribedSegments = getSubscribedSegments(definition);
+    return subscribedSegments.has(segmentId);
+  });
+}
+
+export async function deleteMessageTemplate(
+  params: DeleteMessageTemplateRequest,
+): Promise<MessageTemplate | null> {
+  const [messageTemplate] = await db()
+    .delete(schema.messageTemplate)
+    .where(
+      and(
+        eq(schema.messageTemplate.id, params.id),
+        eq(schema.messageTemplate.workspaceId, params.workspaceId),
+      ),
+    )
+    .returning();
+  if (!messageTemplate) {
+    return null;
+  }
+  return messageTemplate;
 }

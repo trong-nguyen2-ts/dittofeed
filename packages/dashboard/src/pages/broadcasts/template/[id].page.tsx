@@ -373,6 +373,7 @@ const BroadcastTemplateInner: NextPage<BroadcastTemplateProps> =
           }}
           onChange={(e) => {
             setState((draft) => {
+              // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
               draft.selectedChannel = e.target.value as ChannelType;
             });
           }}
@@ -466,7 +467,11 @@ function BroadcastTemplate({ templateId, journeyId }: BroadcastTemplateProps) {
     inner = null;
   } else {
     inner = (
-      <BroadcastTemplateInner templateId={templateId} journeyId={journeyId} />
+      <BroadcastTemplateInner
+        key={templateId}
+        templateId={templateId}
+        journeyId={journeyId}
+      />
     );
   }
   return (

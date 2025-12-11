@@ -13,7 +13,6 @@ import {
   Autocomplete,
   Box,
   Button,
-  ButtonProps,
   Chip,
   CircularProgress,
   Dialog,
@@ -41,12 +40,7 @@ import {
   useTheme,
 } from "@mui/material";
 import { Type } from "@sinclair/typebox";
-import {
-  keepPreviousData,
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
+import { keepPreviousData } from "@tanstack/react-query";
 import {
   ColumnDef,
   flexRender,
@@ -54,32 +48,62 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import axios from "axios";
-import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
-import { schemaValidateWithErr } from "isomorphic-lib/src/resultHandling/schemaValidation";
 import {
-  CompletionStatus,
   CursorDirectionEnum,
-  DeleteUsersRequest,
   GetUsersRequest,
-  GetUsersResponse,
-  GetUsersResponseItem,
-  GetUsersUserPropertyFilter,
+  SortOrderEnum,
 } from "isomorphic-lib/src/types";
 import Link from "next/link";
 import { NextRouter, useRouter } from "next/router";
-import React, { useCallback, useMemo } from "react";
-import { useImmer } from "use-immer";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
-import { useAppStore, useAppStorePick } from "../lib/appStore";
+import { useAppStore } from "../lib/appStore";
+import { useDeleteUserMutation } from "../lib/useDeleteUserMutation";
+import { useUserPropertyResourcesQuery } from "../lib/useUserPropertyResourcesQuery";
+import { useUsersCountQuery } from "../lib/useUsersCountQuery";
+import { useUsersQuery } from "../lib/useUsersQuery";
+import { GreyButton } from "./greyButtonStyle";
 import { greyTextFieldStyles } from "./greyScaleStyles";
 import { SquarePaper } from "./squarePaper";
-import {
-  useUserFiltersHash,
-  useUserFilterState,
-} from "./usersTable/userFiltersState";
+import { SortBySelector } from "./usersTable/sortBySelector";
 import { UsersFilterV2 } from "./usersTable/usersFilterV2";
+import {
+  createUsersTableStore,
+  UsersTableStore,
+  UsersTableStoreInitialState,
+} from "./usersTable/usersTableStore";
 
-// Cell components defined outside the main component
+// ============================================================================
+// Store Context Setup
+// ============================================================================
+
+// Context to hold the store instance
+const UsersTableStoreContext = createContext<ReturnType<
+  typeof createUsersTableStore
+> | null>(null);
+
+// Hook to access the store
+function useUsersTableStore(): UsersTableStore {
+  const store = useContext(UsersTableStoreContext);
+  if (!store) {
+    throw new Error(
+      "useUsersTableStore must be used within a UsersTableStoreProvider",
+    );
+  }
+  return store();
+}
+
+// ============================================================================
+// Cell Components (unchanged from original)
+// ============================================================================
+
 function UserIdCell({
   value,
   userUriTemplate,
@@ -202,7 +226,6 @@ function SegmentsPopover({
     label: segment.name,
   }));
 
-  // Focus the input when the component is rendered
   React.useEffect(() => {
     if (inputRef.current) {
       inputRef.current.focus();
@@ -374,6 +397,7 @@ const userIdCellRenderer = ({
   getValue: () => unknown;
   userUriTemplate: string;
 }) => (
+  // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
   <UserIdCell value={getValue() as string} userUriTemplate={userUriTemplate} />
 );
 
@@ -389,17 +413,25 @@ const segmentsCellRenderer = ({
   row: { original: { segments: { id: string; name: string }[] } };
 }) => <SegmentsCell segments={row.original.segments} />;
 
-// Actions menu item
-function ActionsCell({
-  userId,
-  onOptimisticDelete,
+const sortPropertyCellRenderer = ({
+  getValue,
 }: {
-  userId: string;
-  onOptimisticDelete?: (userId: string) => void;
-}) {
+  getValue: () => unknown;
+}) => {
+  const value = getValue();
+  if (value === null || value === undefined) {
+    return (
+      <Typography variant="body2" color="text.secondary">
+        —
+      </Typography>
+    );
+  }
+  return <Typography variant="body2">{String(value)}</Typography>;
+};
+
+// Actions menu item
+function ActionsCell({ userId }: { userId: string }) {
   const theme = useTheme();
-  const { apiBase, workspace } = useAppStorePick(["apiBase", "workspace"]);
-  const queryClient = useQueryClient();
   const [anchorEl, setAnchorEl] = React.useState<HTMLElement | null>(null);
   const [confirmOpen, setConfirmOpen] = React.useState(false);
   const [deleteSuccess, setDeleteSuccess] = React.useState(false);
@@ -407,51 +439,7 @@ function ActionsCell({
   const [errorMessage, setErrorMessage] = React.useState("");
   const open = Boolean(anchorEl);
 
-  // Get workspaceId from the workspace object
-  const workspaceId =
-    workspace.type === CompletionStatus.Successful ? workspace.value.id : "";
-
-  const deleteUserMutation = useMutation({
-    mutationFn: async () => {
-      if (!workspaceId) {
-        throw new Error("Workspace ID not available");
-      }
-
-      const response = await axios.delete(`${apiBase}/api/users`, {
-        data: {
-          workspaceId,
-          userIds: [userId],
-        } satisfies DeleteUsersRequest,
-      });
-      return response.data;
-    },
-    onMutate: () => {
-      // Optimistically update the UI by removing the user from the table
-      onOptimisticDelete?.(userId);
-    },
-    onSuccess: () => {
-      setDeleteSuccess(true);
-
-      // Invalidate and refetch the users and usersCount queries
-      queryClient.invalidateQueries({ queryKey: ["users"] });
-      queryClient.invalidateQueries({ queryKey: ["usersCount"] });
-    },
-    onError: (error) => {
-      console.error("Failed to delete user:", error);
-      setDeleteError(true);
-
-      // Extract error message from the error response if available
-      if (axios.isAxiosError(error) && error.response?.data?.message) {
-        setErrorMessage(error.response.data.message);
-      } else {
-        setErrorMessage("Failed to delete user. Please try again.");
-      }
-
-      // Since the optimistic update already happened, we need to refetch to restore data
-      queryClient.invalidateQueries({ queryKey: ["users"] });
-      queryClient.invalidateQueries({ queryKey: ["usersCount"] });
-    },
-  });
+  const deleteUserMutation = useDeleteUserMutation();
 
   const handleClick = (event: React.MouseEvent<HTMLElement>) => {
     setAnchorEl(event.currentTarget);
@@ -471,7 +459,23 @@ function ActionsCell({
   };
 
   const handleConfirmDelete = () => {
-    deleteUserMutation.mutate();
+    deleteUserMutation.mutate([userId], {
+      onSuccess: () => {
+        setDeleteSuccess(true);
+      },
+      onError: (error) => {
+        setDeleteError(true);
+        if (axios.isAxiosError(error) && error.response?.data) {
+          // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+          const errorData = error.response.data as { message?: string };
+          setErrorMessage(
+            errorData.message ?? "Failed to delete user. Please try again.",
+          );
+        } else {
+          setErrorMessage("Failed to delete user. Please try again.");
+        }
+      },
+    });
     handleConfirmClose();
   };
 
@@ -597,23 +601,19 @@ function ActionsCell({
   );
 }
 
-const actionsCellRenderer = ({
-  row,
-  table,
-}: {
-  row: { original: { id: string } };
-  table: {
-    options: { meta?: { performOptimisticDelete?: (userId: string) => void } };
+const actionsCellRendererFactory = () => {
+  return function ActionsCellRenderer({
+    row,
+  }: {
+    row: { original: { id: string } };
+  }) {
+    return <ActionsCell userId={row.original.id} />;
   };
-}) => {
-  const onOptimisticDelete = table.options.meta?.performOptimisticDelete;
-  return (
-    <ActionsCell
-      userId={row.original.id}
-      onOptimisticDelete={onOptimisticDelete}
-    />
-  );
 };
+
+// ============================================================================
+// Exports for URL handling
+// ============================================================================
 
 export const UsersTableParams = Type.Pick(GetUsersRequest, [
   "cursor",
@@ -636,7 +636,6 @@ export function usersTablePaginationHandler(router: NextRouter) {
     const newQuery: Record<string, string | string[] | undefined> = {
       ...remainingParams,
     };
-    // delete cursor and direction from newQuery if they don't exist
     if (direction) {
       newQuery.direction = direction;
     }
@@ -652,6 +651,10 @@ export function usersTablePaginationHandler(router: NextRouter) {
   return onUsersTablePaginate;
 }
 
+// ============================================================================
+// Types
+// ============================================================================
+
 interface Row {
   id: string;
   email: string;
@@ -659,34 +662,7 @@ interface Row {
     id: string;
     name: string;
   }[];
-}
-
-export const greyButtonStyle = {
-  bgcolor: "grey.200",
-  color: "grey.700",
-  "&:hover": {
-    bgcolor: "grey.300",
-  },
-  "&:active": {
-    bgcolor: "grey.400",
-  },
-  "&.Mui-disabled": {
-    bgcolor: "grey.100",
-    color: "grey.400",
-  },
-} as const;
-
-function GreyButton(props: ButtonProps) {
-  const { sx, ...rest } = props;
-  return (
-    <Button
-      {...rest}
-      sx={{
-        ...greyButtonStyle,
-        ...sx,
-      }}
-    />
-  );
+  sortPropertyValue?: string | number | boolean | null;
 }
 
 export type OnPaginationChangeProps = Pick<
@@ -694,235 +670,197 @@ export type OnPaginationChangeProps = Pick<
   "direction" | "cursor"
 >;
 
-export type UsersTableProps = Omit<GetUsersRequest, "limit"> & {
-  onPaginationChange: (args: OnPaginationChangeProps) => void;
+export interface OnSortChangeProps {
+  sortBy?: string | null;
+}
+
+export type UsersTableProps = Omit<GetUsersRequest, "workspaceId"> & {
+  onPaginationChange?: (args: OnPaginationChangeProps) => void;
+  onSortChange?: (args: OnSortChangeProps) => void;
   autoReloadByDefault?: boolean;
   reloadPeriodMs?: number;
   userUriTemplate?: string;
+  hideControls?: boolean;
 };
 
-interface TableState {
-  autoReload: boolean;
-  users: Record<string, GetUsersResponseItem>;
-  usersCount: number | null;
-  currentPageUserIds: string[];
-  previousCursor: string | null;
-  nextCursor: string | null;
-  query: {
-    cursor: string | null;
-    limit: number;
-    direction: CursorDirectionEnum | null;
-  };
-}
+// ============================================================================
+// Inner Table Component (uses the store)
+// ============================================================================
 
-export const defaultGetUsersRequest = function getUsersRequest({
-  params,
-  apiBase,
-}: {
-  params: GetUsersRequest;
-  apiBase: string;
-}) {
-  return axios.post(`${apiBase}/api/users`, params);
-};
+// Props used only for initial store state, not needed by the inner component
+type InitialStoreProps =
+  | "autoReloadByDefault"
+  | "cursor"
+  | "direction"
+  | "limit"
+  | "sortBy";
 
-export const getUsersCountRequest = function getUsersCountRequest({
-  params,
-  apiBase,
-}: {
-  params: Omit<GetUsersRequest, "cursor" | "direction" | "limit">;
-  apiBase: string;
-}) {
-  return axios.post(`${apiBase}/api/users/count`, params);
-};
+type UsersTableInnerProps = Omit<UsersTableProps, InitialStoreProps>;
 
-export default function UsersTableV2({
-  workspaceId,
+function UsersTableInner({
   segmentFilter: segmentIds,
   subscriptionGroupFilter: subscriptionGroupIds,
-  direction,
-  cursor,
   onPaginationChange,
-  autoReloadByDefault = false,
-  reloadPeriodMs = 30000,
+  onSortChange,
+  reloadPeriodMs = 10000,
   userUriTemplate = "/users/{userId}",
-}: UsersTableProps) {
-  const apiBase = useAppStore((store) => store.apiBase);
+  hideControls = false,
+}: UsersTableInnerProps) {
+  useAppStore();
 
-  const [userFilterState, userFilterUpdater] = useUserFilterState({
-    segments: segmentIds ? new Set(segmentIds) : undefined,
-    staticSegments: segmentIds ? new Set(segmentIds) : undefined,
-    subscriptionGroups: subscriptionGroupIds
-      ? new Set(subscriptionGroupIds)
-      : undefined,
-    staticSubscriptionGroups: subscriptionGroupIds
-      ? new Set(subscriptionGroupIds)
-      : undefined,
-  });
+  // Get store state and actions
+  const store = useUsersTableStore();
+  const {
+    autoReload,
+    users,
+    currentPageUserIds,
+    nextCursor,
+    previousCursor,
+    sortBy,
+    sortOrder,
+    usersCount,
+    segments,
+    subscriptionGroups,
+    userProperties,
+    staticSegments,
+    staticSubscriptionGroups,
+  } = store;
 
-  const [state, setState] = useImmer<TableState>({
-    autoReload: autoReloadByDefault,
-    query: {
-      cursor: cursor ?? null,
-      direction: direction ?? null,
-      limit: 10,
-    },
-    users: {},
-    usersCount: null,
-    currentPageUserIds: [],
-    nextCursor: null,
-    previousCursor: null,
-  });
+  const {
+    goToNextPage,
+    goToPreviousPage,
+    goToFirstPage,
+    setSortBy,
+    setSortOrder,
+    setStaticSegments,
+    setStaticSubscriptionGroups,
+    addSegment,
+    removeSegment,
+    addSubscriptionGroup,
+    removeSubscriptionGroup,
+    addUserPropertyFilter,
+    removeUserPropertyFilter,
+    handleUsersResponse,
+    setUsersCount,
+    toggleAutoReload,
+    getQueryParams,
+    getFilterParams,
+  } = store;
 
-  const filtersHash = useUserFiltersHash(userFilterState);
-
-  // Function to prepare common filter parameters for both queries
-  const getCommonQueryParams = useCallback(() => {
-    const requestUserPropertyFilter: GetUsersUserPropertyFilter | undefined =
-      userFilterState.userProperties.size > 0
-        ? Array.from(userFilterState.userProperties).map((up) => ({
-            id: up[0],
-            values: Array.from(up[1]),
-          }))
-        : undefined;
-
-    const allFilterSegments = new Set<string>(userFilterState.segments);
+  // Sync static segments from props
+  useEffect(() => {
     if (segmentIds) {
-      for (const segmentId of segmentIds) {
-        allFilterSegments.add(segmentId);
-      }
+      setStaticSegments(segmentIds);
     }
+  }, [segmentIds, setStaticSegments]);
 
-    const allFilterSubscriptionGroups = new Set<string>(
-      userFilterState.subscriptionGroups,
-    );
+  // Sync static subscription groups from props
+  useEffect(() => {
     if (subscriptionGroupIds) {
-      for (const subscriptionGroupId of subscriptionGroupIds) {
-        allFilterSubscriptionGroups.add(subscriptionGroupId);
-      }
+      setStaticSubscriptionGroups(subscriptionGroupIds);
     }
+  }, [subscriptionGroupIds, setStaticSubscriptionGroups]);
 
-    return {
-      segmentFilter:
-        allFilterSegments.size > 0 ? Array.from(allFilterSegments) : undefined,
-      subscriptionGroupFilter:
-        allFilterSubscriptionGroups.size > 0
-          ? Array.from(allFilterSubscriptionGroups)
-          : undefined,
-      workspaceId,
-      userPropertyFilter: requestUserPropertyFilter,
-    };
-  }, [userFilterState, segmentIds, subscriptionGroupIds, workspaceId]);
-
-  // Query for fetching users count
-  const countQuery = useQuery({
-    queryKey: [
-      "usersCount",
-      workspaceId,
-      segmentIds,
-      subscriptionGroupIds,
-      filtersHash,
-    ],
+  // Query for users list
+  const queryParams = getQueryParams();
+  const usersListQuery = useUsersQuery(queryParams, {
+    refetchInterval: autoReload ? reloadPeriodMs : false,
     placeholderData: keepPreviousData,
-    queryFn: async () => {
-      const commonParams = getCommonQueryParams();
-
-      try {
-        const response = await getUsersCountRequest({
-          params: commonParams,
-          apiBase,
-        });
-
-        return response.data.userCount;
-      } catch (error) {
-        console.error("Failed to fetch users count", error);
-        throw error;
-      }
-    },
-    refetchInterval: state.autoReload ? reloadPeriodMs : false,
   });
 
-  // Main query for fetching users
-  const query = useQuery<GetUsersResponse>({
-    queryKey: ["users", state.query, segmentIds, filtersHash],
-    queryFn: async () => {
-      const commonParams = getCommonQueryParams();
-
-      const params: GetUsersRequest = {
-        ...commonParams,
-        cursor: state.query.cursor ?? undefined,
-        direction: state.query.direction ?? undefined,
-        limit: state.query.limit,
-      };
-
-      const response = await defaultGetUsersRequest({
-        params,
-        apiBase,
-      });
-
-      const result = unwrap(
-        schemaValidateWithErr(response.data, GetUsersResponse),
-      );
-
-      if (result.users.length === 0 && cursor) {
-        if (state.query.direction === CursorDirectionEnum.Before) {
-          setState((draft) => {
-            draft.nextCursor = null;
-            draft.previousCursor = null;
-            draft.query.cursor = null;
-            draft.query.direction = null;
-          });
-          onPaginationChange({});
-        }
-      } else {
-        setState((draft) => {
-          for (const user of result.users) {
-            draft.users[user.id] = user;
-          }
-          draft.currentPageUserIds = result.users.map((u) => u.id);
-          draft.nextCursor = result.nextCursor ?? null;
-          draft.previousCursor = result.previousCursor ?? null;
-        });
-      }
-
-      return result;
-    },
+  // Query for users count
+  const filterParams = getFilterParams();
+  const countQuery = useUsersCountQuery(filterParams, {
+    refetchInterval: autoReload ? reloadPeriodMs : false,
     placeholderData: keepPreviousData,
-    refetchInterval: state.autoReload ? reloadPeriodMs : false,
   });
 
+  // Query for user property names
+  const userPropertiesQuery = useUserPropertyResourcesQuery();
+
+  // Handle users list response
+  useEffect(() => {
+    if (usersListQuery.data) {
+      handleUsersResponse(usersListQuery.data);
+    }
+  }, [usersListQuery.data, handleUsersResponse]);
+
+  // Handle users count response
+  useEffect(() => {
+    if (countQuery.data !== undefined) {
+      setUsersCount(countQuery.data);
+    }
+  }, [countQuery.data, setUsersCount]);
+
+  // Get the name of the current sort property
+  const sortPropertyName = useMemo(() => {
+    if (!sortBy || sortBy === "id") {
+      return null;
+    }
+    const properties = userPropertiesQuery.data?.userProperties ?? [];
+    const found = properties.find((p) => p.id === sortBy);
+    return found?.name ?? null;
+  }, [sortBy, userPropertiesQuery.data]);
+
+  // Transform store data to table rows
   const usersData = useMemo<Row[]>(() => {
-    return state.currentPageUserIds.flatMap((id) => {
-      const user = state.users[id];
+    return currentPageUserIds.flatMap((id) => {
+      const user = users[id];
       if (!user) {
         return [];
       }
 
-      // Find the email property if it exists
       let email = "";
+      let sortPropertyValue: string | number | boolean | null | undefined;
+
       for (const propId in user.properties) {
         const prop = user.properties[propId];
         if (prop && prop.name.toLowerCase() === "email") {
-          email = prop.value;
-          break;
+          // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+          email = prop.value as string;
+        }
+        if (sortBy && propId === sortBy && prop) {
+          // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+          sortPropertyValue = prop.value as string | number | boolean | null;
         }
       }
 
-      return {
-        id: user.id,
-        email,
-        segments: user.segments,
-      };
+      return [
+        {
+          id: user.id,
+          email,
+          segments: user.segments,
+          sortPropertyValue,
+        },
+      ];
     });
-  }, [state.currentPageUserIds, state.users]);
+  }, [currentPageUserIds, users, sortBy]);
 
-  const columns = useMemo<ColumnDef<Row>[]>(
-    () => [
+  const actionsCellRenderer = useMemo(() => {
+    return actionsCellRendererFactory();
+  }, []);
+
+  const columns = useMemo<ColumnDef<Row>[]>(() => {
+    const baseColumns: ColumnDef<Row>[] = [
       {
         id: "id",
         header: "User ID",
         accessorKey: "id",
         cell: (info) => userIdCellRenderer({ ...info, userUriTemplate }),
       },
+    ];
+
+    // Add sort property column second (after User ID) if sorting by a user property
+    if (sortPropertyName && sortBy && sortBy !== "id") {
+      baseColumns.push({
+        id: "sortProperty",
+        header: sortPropertyName,
+        accessorKey: "sortPropertyValue",
+        cell: sortPropertyCellRenderer,
+      });
+    }
+
+    baseColumns.push(
       {
         id: "email",
         header: "Email",
@@ -941,106 +879,92 @@ export default function UsersTableV2({
         size: 70,
         cell: actionsCellRenderer,
       },
-    ],
-    [userUriTemplate],
-  );
+    );
 
-  // Function to optimistically delete a user from the table
-  const performOptimisticDelete = useCallback(
-    (userId: string) => {
-      setState((draft) => {
-        // Remove user from currentPageUserIds array
-        draft.currentPageUserIds = draft.currentPageUserIds.filter(
-          (id) => id !== userId,
-        );
-
-        // Remove user from users object
-        if (draft.users[userId]) {
-          delete draft.users[userId];
-        }
-
-        // Decrement the count if it exists
-        if (draft.usersCount !== null) {
-          draft.usersCount -= 1;
-        }
-      });
-    },
-    [setState],
-  );
+    return baseColumns;
+  }, [userUriTemplate, actionsCellRenderer, sortPropertyName, sortBy]);
 
   const table = useReactTable({
     columns,
     data: usersData,
     manualPagination: true,
     getCoreRowModel: getCoreRowModel(),
-    meta: {
-      performOptimisticDelete,
-    },
   });
 
-  const onNextPage = useCallback(() => {
-    if (state.nextCursor) {
-      onPaginationChange({
-        cursor: state.nextCursor,
-        direction: CursorDirectionEnum.After,
-      });
-      setState((draft) => {
-        draft.query.cursor = state.nextCursor;
-        draft.query.direction = CursorDirectionEnum.After;
-      });
-    }
-  }, [state.nextCursor, onPaginationChange, setState]);
-
-  const onPreviousPage = useCallback(() => {
-    if (state.previousCursor) {
-      onPaginationChange({
-        cursor: state.previousCursor,
-        direction: CursorDirectionEnum.Before,
-      });
-      setState((draft) => {
-        draft.query.cursor = state.previousCursor;
-        draft.query.direction = CursorDirectionEnum.Before;
-      });
-    }
-  }, [state.previousCursor, onPaginationChange, setState]);
-
-  const onFirstPage = useCallback(() => {
-    onPaginationChange({});
-    setState((draft) => {
-      draft.query.cursor = null;
+  // Pagination handlers that also notify parent
+  const handleNextPage = useCallback(() => {
+    goToNextPage();
+    onPaginationChange?.({
+      cursor: nextCursor ?? undefined,
+      direction: CursorDirectionEnum.After,
     });
-  }, [onPaginationChange, setState]);
+  }, [goToNextPage, nextCursor, onPaginationChange]);
+
+  const handlePreviousPage = useCallback(() => {
+    goToPreviousPage();
+    onPaginationChange?.({
+      cursor: previousCursor ?? undefined,
+      direction: CursorDirectionEnum.Before,
+    });
+  }, [goToPreviousPage, previousCursor, onPaginationChange]);
+
+  const handleFirstPage = useCallback(() => {
+    goToFirstPage();
+    onPaginationChange?.({});
+  }, [goToFirstPage, onPaginationChange]);
 
   const handleRefresh = useCallback(() => {
-    query.refetch();
+    usersListQuery.refetch();
     countQuery.refetch();
-  }, [query, countQuery]);
+  }, [usersListQuery, countQuery]);
 
-  const toggleAutoRefresh = useCallback(() => {
-    setState((draft) => {
-      draft.autoReload = !draft.autoReload;
-    });
-  }, [setState]);
+  const handleSortChange = useCallback(
+    (newSortBy: string | null) => {
+      setSortBy(newSortBy);
+      onSortChange?.({ sortBy: newSortBy });
+      onPaginationChange?.({});
+    },
+    [setSortBy, onSortChange, onPaginationChange],
+  );
 
-  const isLoading = query.isPending || query.isFetching;
+  const handleSortOrderChange = useCallback(
+    (newSortOrder: SortOrderEnum) => {
+      setSortOrder(newSortOrder);
+      onPaginationChange?.({});
+    },
+    [setSortOrder, onPaginationChange],
+  );
 
-  return (
-    <Stack
-      spacing={1}
-      sx={{
-        width: "100%",
-        height: "100%",
-        minWidth: 0,
-        alignItems: "stretch",
-      }}
-    >
+  const isLoading = usersListQuery.isPending || usersListQuery.isFetching;
+
+  let controls: React.ReactNode = null;
+  if (!hideControls) {
+    controls = (
       <Stack
         direction="row"
         alignItems="center"
         spacing={1}
         sx={{ width: "100%", height: "48px" }}
       >
-        <UsersFilterV2 state={userFilterState} updater={userFilterUpdater} />
+        <UsersFilterV2
+          userProperties={userProperties}
+          segments={segments}
+          staticSegments={staticSegments}
+          subscriptionGroups={subscriptionGroups}
+          staticSubscriptionGroups={staticSubscriptionGroups}
+          onRemoveSegment={removeSegment}
+          onRemoveSubscriptionGroup={removeSubscriptionGroup}
+          onRemoveUserProperty={removeUserPropertyFilter}
+          onAddSegment={addSegment}
+          onAddSubscriptionGroup={addSubscriptionGroup}
+          onAddUserProperty={addUserPropertyFilter}
+        />
+        <SortBySelector
+          sortBy={sortBy}
+          sortOrder={sortOrder}
+          onSortByChange={handleSortChange}
+          onSortOrderChange={handleSortOrderChange}
+        />
         <Box flex={1} />
         <Tooltip title="Refresh Results" placement="bottom-start">
           <IconButton
@@ -1058,14 +982,14 @@ export default function UsersTableV2({
           placement="bottom-start"
         >
           <IconButton
-            onClick={toggleAutoRefresh}
+            onClick={toggleAutoReload}
             sx={{
               border: "1px solid",
               borderColor: "grey.400",
-              bgcolor: state.autoReload ? "grey.600" : "inherit",
-              color: state.autoReload ? "white" : "inherit",
+              bgcolor: autoReload ? "grey.600" : "inherit",
+              color: autoReload ? "white" : "inherit",
               "&:hover": {
-                bgcolor: state.autoReload ? "grey.700" : undefined,
+                bgcolor: autoReload ? "grey.700" : undefined,
               },
             }}
           >
@@ -1073,6 +997,20 @@ export default function UsersTableV2({
           </IconButton>
         </Tooltip>
       </Stack>
+    );
+  }
+
+  return (
+    <Stack
+      spacing={1}
+      sx={{
+        width: "100%",
+        height: "100%",
+        minWidth: 0,
+        alignItems: "stretch",
+      }}
+    >
+      {controls}
       <TableContainer component={Paper}>
         <Table stickyHeader>
           <TableHead>
@@ -1135,22 +1073,22 @@ export default function UsersTableV2({
                 >
                   <Stack direction="row" alignItems="center" spacing={2}>
                     <GreyButton
-                      onClick={onFirstPage}
-                      disabled={!state.previousCursor}
+                      onClick={handleFirstPage}
+                      disabled={!previousCursor}
                       startIcon={<KeyboardDoubleArrowLeft />}
                     >
                       First
                     </GreyButton>
                     <GreyButton
-                      onClick={onPreviousPage}
-                      disabled={!state.previousCursor}
+                      onClick={handlePreviousPage}
+                      disabled={!previousCursor}
                       startIcon={<KeyboardArrowLeft />}
                     >
                       Previous
                     </GreyButton>
                     <GreyButton
-                      onClick={onNextPage}
-                      disabled={!state.nextCursor}
+                      onClick={handleNextPage}
+                      disabled={!nextCursor}
                       endIcon={<KeyboardArrowRight />}
                     >
                       Next
@@ -1178,7 +1116,7 @@ export default function UsersTableV2({
                             height: "100%",
                           }}
                         >
-                          Total users: {countQuery.data ?? 0}
+                          Total users: {countQuery.data ?? usersCount ?? 0}
                         </Typography>
                       </Stack>
                     )}
@@ -1190,5 +1128,44 @@ export default function UsersTableV2({
         </Table>
       </TableContainer>
     </Stack>
+  );
+}
+
+// ============================================================================
+// Main Component (wraps inner with store provider)
+// ============================================================================
+
+export default function UsersTableV2({
+  segmentFilter,
+  subscriptionGroupFilter,
+  cursor,
+  direction,
+  sortBy,
+  limit,
+  autoReloadByDefault,
+  ...innerProps
+}: UsersTableProps) {
+  // Create a stable store instance that captures initial props
+  const [store] = useState(() => {
+    const initialState: UsersTableStoreInitialState = {
+      staticSegmentIds: segmentFilter,
+      staticSubscriptionGroupIds: subscriptionGroupFilter,
+      cursor: cursor ?? undefined,
+      direction: direction ?? undefined,
+      sortBy: sortBy ?? undefined,
+      limit: limit ?? 10,
+      autoReloadByDefault: autoReloadByDefault ?? false,
+    };
+    return createUsersTableStore(initialState);
+  });
+
+  return (
+    <UsersTableStoreContext.Provider value={store}>
+      <UsersTableInner
+        segmentFilter={segmentFilter}
+        subscriptionGroupFilter={subscriptionGroupFilter}
+        {...innerProps}
+      />
+    </UsersTableStoreContext.Provider>
   );
 }

@@ -1,10 +1,13 @@
+import { SESv2ServiceException } from "@aws-sdk/client-sesv2";
 import { MessagesMessage as MailChimpMessage } from "@mailchimp/mailchimp_transactional";
 import { MailDataRequired } from "@sendgrid/mail";
-import axios, { AxiosError } from "axios";
+import axios, { AxiosError, AxiosHeaders } from "axios";
+import { randomUUID } from "crypto";
 import { and, eq, SQL } from "drizzle-orm";
 import { toMjml } from "emailo/src/toMjml";
 import { CHANNEL_IDENTIFIERS } from "isomorphic-lib/src/channels";
 import { MESSAGE_ID_HEADER, SecretNames } from "isomorphic-lib/src/constants";
+import { isWorkspaceWideProvider } from "isomorphic-lib/src/email";
 import { messageTemplateDraftToDefinition } from "isomorphic-lib/src/messageTemplates";
 import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 import {
@@ -16,11 +19,14 @@ import { err, ok, Result } from "neverthrow";
 import { PostgresError } from "pg-error-enum";
 import { Message as PostMarkRequiredFields } from "postmark";
 import * as R from "remeda";
+import { omit } from "remeda";
 import { Overwrite } from "utility-types";
 import { validate as validateUuid } from "uuid";
 
+import { submitBatch } from "./apps/batch";
 import { getObject, storage } from "./blobStorage";
-import { db, queryResult } from "./db";
+import { MESSAGE_METADATA_FIELDS } from "./constants";
+import { db, TxQueryError, txQueryResult } from "./db";
 import {
   defaultEmailProvider as dbDefaultEmailProvider,
   defaultSmsProvider as dbDefaultSmsProvider,
@@ -28,6 +34,7 @@ import {
   messageTemplate as dbMessageTemplate,
   secret as dbSecret,
   smsProvider as dbSmsProvider,
+  subscriptionGroup as dbSubscriptionGroup,
   workspace as dbWorkspace,
 } from "./db/schema";
 import {
@@ -41,6 +48,7 @@ import {
   sendMail as sendMailResend,
 } from "./destinations/resend";
 import { sendMail as sendMailSendgrid } from "./destinations/sendgrid";
+import { sendSms as sendSmsSignalWire } from "./destinations/signalwire";
 import {
   sendMail as sendMailSmtp,
   SendSmtpMailParams,
@@ -48,7 +56,13 @@ import {
 import {
   Sender as TwilioSender,
   sendSms as sendSmsTwilio,
+  TwilioAuth,
 } from "./destinations/twilio";
+import {
+  getAndRefreshGmailAccessToken,
+  sendGmailEmail,
+  SendGmailEmailParams,
+} from "./gmail";
 import { renderLiquid } from "./liquid";
 import logger from "./logger";
 import {
@@ -57,18 +71,28 @@ import {
 } from "./messaging/email";
 import { withSpan } from "./openTelemetry";
 import {
+  getSubscriptionGroupDetails,
+  getSubscriptionGroupsWithAssignments,
   inSubscriptionGroup,
   SubscriptionGroupDetails,
 } from "./subscriptionGroups";
 import {
+  AppDataFileInternal,
+  AppFileType,
   BackendMessageSendResult,
   BadWorkspaceConfigurationType,
-  BlobStorageFile,
+  BatchMessageUsersRequest,
+  BatchMessageUsersResponse,
+  BatchMessageUsersResult,
+  BatchMessageUsersResultTypeEnum,
   ChannelType,
-  EmailProvider,
+  EmailContentsType,
   EmailProviderSecret,
   EmailProviderType,
+  EmailProviderTypeSchema,
+  EventType,
   InternalEventType,
+  KnownBatchTrackData,
   MessageSendFailure,
   MessageSkippedType,
   MessageTags,
@@ -77,15 +101,22 @@ import {
   MessageTemplateResource,
   MessageTemplateResourceDefinition,
   MessageTemplateResourceDraft,
+  MessageTemplateTestRequest,
   MessageWebhookServiceFailure,
   MessageWebhookSuccess,
   MobilePushProviderType,
+  NonRetryableMessageSendFailure,
   ParsedWebhookBody,
   Secret,
+  SignalWireSecret,
+  SignalWireSenderOverrideType,
   SmsProvider,
   SmsProviderOverride,
   SmsProviderSecret,
   SmsProviderType,
+  SubscriptionChange,
+  SubscriptionGroupType,
+  TrackData,
   TwilioSecret,
   TwilioSenderOverrideType,
   UpsertMessageTemplateResource,
@@ -96,6 +127,8 @@ import {
   WebhookSecret,
 } from "./types";
 import { UserPropertyAssignments } from "./userProperties";
+import { getUsers } from "./users";
+import { isWorkspaceOccupantType } from "./workspaceOccupantSettings";
 
 export function enrichMessageTemplate({
   id,
@@ -168,6 +201,26 @@ export async function findMessageTemplate({
   });
 }
 
+function doesRequireDraftReset({
+  priorDefinition,
+  newDefinition,
+}: {
+  priorDefinition: MessageTemplateResourceDefinition;
+  newDefinition: MessageTemplateResourceDefinition;
+}): boolean {
+  if (priorDefinition.type !== newDefinition.type) {
+    return true;
+  }
+  if (
+    newDefinition.type === ChannelType.Email &&
+    priorDefinition.type === ChannelType.Email &&
+    newDefinition.emailContentsType !== priorDefinition.emailContentsType
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export async function upsertMessageTemplate(
   data: UpsertMessageTemplateResource,
 ): Promise<
@@ -179,33 +232,102 @@ export async function upsertMessageTemplate(
       message: "Invalid message template id, must be a valid v4 UUID",
     });
   }
-  const result = await queryResult(
-    db()
-      .insert(dbMessageTemplate)
-      .values({
-        id: data.id,
-        workspaceId: data.workspaceId,
-        name: data.name,
-        definition: data.definition,
-        draft: data.draft,
-      })
-      .onConflictDoUpdate({
-        target: data.id
-          ? [dbMessageTemplate.id]
-          : [dbMessageTemplate.workspaceId, dbMessageTemplate.name],
-        set: {
-          name: data.name,
-          definition: data.definition,
-          draft: data.draft,
-        },
-        setWhere: eq(dbMessageTemplate.workspaceId, data.workspaceId),
-      })
-      .returning(),
-  );
-  if (result.isErr()) {
+  const txResult: Result<MessageTemplate, TxQueryError> =
+    await db().transaction(async (tx) => {
+      const findFirstConditions: SQL[] = [
+        eq(dbMessageTemplate.workspaceId, data.workspaceId),
+      ];
+      if (data.id) {
+        findFirstConditions.push(eq(dbMessageTemplate.id, data.id));
+      } else {
+        findFirstConditions.push(eq(dbMessageTemplate.name, data.name));
+      }
+      const existingTemplate = await tx.query.messageTemplate.findFirst({
+        where: and(...findFirstConditions),
+      });
+      if (!existingTemplate) {
+        const createResult = await txQueryResult(
+          tx
+            .insert(dbMessageTemplate)
+            .values({
+              id: data.id,
+              workspaceId: data.workspaceId,
+              name: data.name,
+              definition: data.definition,
+              draft: data.draft,
+              resourceType: data.resourceType,
+            })
+            .returning(),
+        );
+        if (createResult.isErr()) {
+          return err(createResult.error);
+        }
+        const createdTemplate = createResult.value[0];
+        if (!createdTemplate) {
+          logger().error(
+            {
+              workspaceId: data.workspaceId,
+              name: data.name,
+            },
+            "message template not found",
+          );
+          throw new Error("message template not found");
+        }
+        return ok(createdTemplate);
+      }
+      const existingDefinition = schemaValidateWithErr(
+        existingTemplate.definition,
+        MessageTemplateResourceDefinition,
+      );
+      if (existingDefinition.isErr()) {
+        logger().error(
+          {
+            err: existingDefinition.error,
+            id: existingTemplate.id,
+            workspaceId: data.workspaceId,
+          },
+          "existing message template definition is invalid",
+        );
+        throw new Error("existing message template definition is invalid");
+      }
+      const requiresDraftReset =
+        data.definition !== undefined &&
+        doesRequireDraftReset({
+          priorDefinition: existingDefinition.value,
+          newDefinition: data.definition,
+        });
+      const updateResult = await txQueryResult(
+        tx
+          .update(dbMessageTemplate)
+          .set({
+            name: data.name,
+            definition: data.definition,
+            draft: requiresDraftReset ? null : data.draft,
+            resourceType: data.resourceType,
+          })
+          .where(eq(dbMessageTemplate.id, existingTemplate.id))
+          .returning(),
+      );
+      if (updateResult.isErr()) {
+        return err(updateResult.error);
+      }
+      const updatedTemplate = updateResult.value[0];
+      if (!updatedTemplate) {
+        logger().error(
+          {
+            workspaceId: data.workspaceId,
+            id: existingTemplate.id,
+          },
+          "message template not found",
+        );
+        throw new Error("message template not found");
+      }
+      return ok(updatedTemplate);
+    });
+  if (txResult.isErr()) {
     if (
-      result.error.code === PostgresError.UNIQUE_VIOLATION ||
-      result.error.code === PostgresError.FOREIGN_KEY_VIOLATION
+      txResult.error.code === PostgresError.UNIQUE_VIOLATION ||
+      txResult.error.code === PostgresError.FOREIGN_KEY_VIOLATION
     ) {
       return err({
         type: UpsertMessageTemplateValidationErrorType.UniqueConstraintViolation,
@@ -213,17 +335,19 @@ export async function upsertMessageTemplate(
           "Names must be unique in workspace. Id's must be globally unique.",
       });
     }
-    throw result.error;
+    logger().error(
+      {
+        err: txResult.error,
+        data,
+      },
+      "Failed to upsert message template",
+    );
+    throw new Error(
+      `Failed to upsert message template: code=${txResult.error.code}`,
+    );
   }
 
-  const [messageTemplate] = result.value;
-  if (!messageTemplate) {
-    return err({
-      type: UpsertMessageTemplateValidationErrorType.UniqueConstraintViolation,
-      message:
-        "Names must be unique in workspace. Id's must be globally unique.",
-    });
-  }
+  const messageTemplate = txResult.value;
   return ok(unwrap(enrichMessageTemplate(messageTemplate)));
 }
 
@@ -254,7 +378,7 @@ async function getSendMessageModels({
   workspaceId: string;
   templateId: string;
   channel: ChannelType;
-  subscriptionGroupDetails?: SubscriptionGroupDetails;
+  subscriptionGroupDetails?: Omit<SubscriptionGroupDetails, "name">;
   useDraft?: boolean;
 }): Promise<
   Result<
@@ -335,13 +459,6 @@ async function getSendMessageModels({
     definitionFromDraft ?? messageTemplate.definition ?? null;
 
   if (!messageTemplateDefinition) {
-    logger().debug(
-      {
-        messageTemplate,
-      },
-      "message template has no definition",
-    );
-
     return err({
       type: InternalEventType.BadWorkspaceConfiguration,
       variant: {
@@ -355,19 +472,24 @@ async function getSendMessageModels({
   });
 }
 
+export type SubscriptionGroupDetailsWithName = SubscriptionGroupDetails & {
+  name: string;
+};
+
 export interface SendMessageParametersBase {
   workspaceId: string;
   userId: string;
   templateId: string;
   userPropertyAssignments: UserPropertyAssignments;
-  subscriptionGroupDetails?: SubscriptionGroupDetails & { name: string };
+  subscriptionGroupDetails?: SubscriptionGroupDetailsWithName;
   messageTags?: MessageTags;
   useDraft: boolean;
+  isPreview?: boolean;
 }
 
 export interface SendMessageParametersEmail extends SendMessageParametersBase {
   channel: (typeof ChannelType)["Email"];
-  providerOverride?: EmailProviderType;
+  providerOverride?: EmailProviderTypeSchema;
 }
 
 export type SendMessageParametersSms = SendMessageParametersBase &
@@ -486,7 +608,6 @@ async function getSmsProvider({
     workspaceId,
     providerOverride,
   });
-  logger().debug({ provider }, "sms provider");
   if (provider) {
     return provider;
   }
@@ -513,8 +634,6 @@ function getMessageFileId({
   return `${messageId}-${name}`;
 }
 
-type EmailProviderPayload = (EmailProvider & { secret: Secret | null }) | null;
-
 function getWebsiteFromFromEmail(from: string): string | null {
   const fromParts = from.split("@");
   if (fromParts.length !== 2 || !fromParts[1]) {
@@ -528,13 +647,13 @@ function getWebsiteFromFromEmail(from: string): string | null {
   }
 }
 
-async function getEmailProviderForWorkspace({
+async function getEmailProviderSecretForWorkspace({
   providerOverride,
   workspaceId,
 }: {
   workspaceId: string;
-  providerOverride?: EmailProviderType;
-}): Promise<EmailProviderPayload> {
+  providerOverride?: EmailProviderTypeSchema;
+}): Promise<Secret | null> {
   if (providerOverride) {
     const provider = await db().query.emailProvider.findFirst({
       where: and(
@@ -545,7 +664,7 @@ async function getEmailProviderForWorkspace({
         secret: true,
       },
     });
-    return provider ?? null;
+    return provider?.secret ?? null;
   }
   const defaultProvider = await db().query.defaultEmailProvider.findFirst({
     where: eq(dbDefaultEmailProvider.workspaceId, workspaceId),
@@ -558,23 +677,29 @@ async function getEmailProviderForWorkspace({
     },
   });
 
-  return defaultProvider?.emailProvider ?? null;
+  return defaultProvider?.emailProvider.secret ?? null;
 }
 
-async function getEmailProvider({
-  providerOverride,
+const PROVIDER_NOT_FOUND_ERROR = {
+  type: InternalEventType.BadWorkspaceConfiguration,
+  variant: {
+    type: BadWorkspaceConfigurationType.MessageServiceProviderNotFound,
+  },
+} as const;
+
+async function getEmailProviderSecretForWorkspaceHierarchical({
   workspaceId,
+  providerOverride,
 }: {
   workspaceId: string;
-  providerOverride?: EmailProviderType;
-}): Promise<EmailProviderPayload> {
-  const provider = await getEmailProviderForWorkspace({
+  providerOverride?: EmailProviderTypeSchema;
+}): Promise<Secret | null> {
+  const secret = await getEmailProviderSecretForWorkspace({
     workspaceId,
     providerOverride,
   });
-  logger().debug({ provider }, "email provider");
-  if (provider) {
-    return provider;
+  if (secret) {
+    return secret;
   }
   const workspace = await db().query.workspace.findFirst({
     where: eq(dbWorkspace.id, workspaceId),
@@ -583,10 +708,102 @@ async function getEmailProvider({
   if (!parentWorkspaceId) {
     return null;
   }
-  return getEmailProviderForWorkspace({
+  return getEmailProviderSecretForWorkspace({
     workspaceId: parentWorkspaceId,
     providerOverride,
   });
+}
+
+async function getEmailProvider({
+  providerOverride,
+  workspaceId,
+  workspaceOccupantId,
+  workspaceOccupantType,
+}: {
+  workspaceId: string;
+  providerOverride?: EmailProviderTypeSchema;
+  workspaceOccupantId?: string;
+  workspaceOccupantType?: string;
+}): Promise<Result<EmailProviderSecret, MessageSendFailure>> {
+  let emailProviderSecret: EmailProviderSecret | null = null;
+  if (providerOverride && !isWorkspaceWideProvider(providerOverride)) {
+    if (
+      !workspaceOccupantId ||
+      !isWorkspaceOccupantType(workspaceOccupantType)
+    ) {
+      logger().error(
+        {
+          workspaceId,
+          workspaceOccupantId,
+          workspaceOccupantType,
+        },
+        "email provider not found for non-workspace-wide provider. workspaceOccupantId and workspaceOccupantType must be provided.",
+      );
+      return err(PROVIDER_NOT_FOUND_ERROR);
+    }
+    switch (providerOverride) {
+      case EmailProviderType.Gmail: {
+        const gmailCredentials = await getAndRefreshGmailAccessToken({
+          workspaceId,
+          workspaceOccupantId,
+          workspaceOccupantType,
+        });
+        if (!gmailCredentials) {
+          logger().info(
+            {
+              workspaceId,
+              workspaceOccupantId,
+              workspaceOccupantType,
+            },
+            "gmail credentials not found",
+          );
+          return err(PROVIDER_NOT_FOUND_ERROR);
+        }
+        emailProviderSecret = {
+          type: EmailProviderType.Gmail,
+          email: gmailCredentials.email,
+          accessToken: gmailCredentials.accessToken,
+          refreshToken: gmailCredentials.refreshToken,
+          expiresAt: gmailCredentials.expiresAt,
+        };
+        break;
+      }
+      default:
+        assertUnreachable(providerOverride);
+    }
+  } else {
+    const secret = await getEmailProviderSecretForWorkspaceHierarchical({
+      workspaceId,
+      providerOverride,
+    });
+    if (!secret) {
+      logger().info(
+        {
+          workspaceId,
+          providerOverride,
+        },
+        "email provider not found for workspace",
+      );
+      return err(PROVIDER_NOT_FOUND_ERROR);
+    }
+
+    const secretConfigResult = schemaValidateWithErr(
+      secret.configValue,
+      EmailProviderSecret,
+    );
+    if (secretConfigResult.isErr()) {
+      return err({
+        type: InternalEventType.BadWorkspaceConfiguration,
+        variant: {
+          type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+          message:
+            "Application error: message service provider config malformed.",
+        },
+      });
+    }
+    emailProviderSecret = secretConfigResult.value;
+  }
+  return ok(emailProviderSecret);
 }
 
 export async function sendEmail({
@@ -598,11 +815,12 @@ export async function sendEmail({
   userId,
   providerOverride,
   useDraft,
+  isPreview,
 }: Omit<
   SendMessageParametersEmail,
   "channel"
 >): Promise<BackendMessageSendResult> {
-  const [getSendModelsResult, emailProvider] = await Promise.all([
+  const [getSendModelsResult, emailProviderResult] = await Promise.all([
     getSendMessageModels({
       workspaceId,
       templateId,
@@ -613,6 +831,8 @@ export async function sendEmail({
     getEmailProvider({
       workspaceId,
       providerOverride,
+      workspaceOccupantId: messageTags?.workspaceOccupantId,
+      workspaceOccupantType: messageTags?.workspaceOccupantType,
     }),
   ]);
   if (getSendModelsResult.isErr()) {
@@ -620,15 +840,6 @@ export async function sendEmail({
   }
   const { messageTemplateDefinition, subscriptionGroupSecret } =
     getSendModelsResult.value;
-
-  if (!emailProvider) {
-    return err({
-      type: InternalEventType.BadWorkspaceConfiguration,
-      variant: {
-        type: BadWorkspaceConfigurationType.MessageServiceProviderNotFound,
-      },
-    });
-  }
 
   if (messageTemplateDefinition.type !== ChannelType.Email) {
     return err({
@@ -641,7 +852,9 @@ export async function sendEmail({
   }
   const identifierKey = CHANNEL_IDENTIFIERS[ChannelType.Email];
   let emailBody: string;
-  if ("emailContentsType" in messageTemplateDefinition) {
+  if (
+    messageTemplateDefinition.emailContentsType === EmailContentsType.LowCode
+  ) {
     const mjml = toMjml({
       content: messageTemplateDefinition.body,
       mode: "render",
@@ -656,6 +869,7 @@ export async function sendEmail({
     subscriptionGroupId: subscriptionGroupDetails?.id,
     workspaceId,
     tags: messageTags,
+    isPreview,
     templates: {
       from: {
         contents: messageTemplateDefinition.from,
@@ -748,6 +962,7 @@ export async function sendEmail({
       subscriptionGroupId: subscriptionGroupDetails?.id,
       workspaceId,
       tags: messageTags,
+      isPreview,
       templates: headersToRender,
     });
     if (renderedCustomHeaders.isErr()) {
@@ -796,41 +1011,6 @@ export async function sendEmail({
     ...unsubscribeHeaders,
   };
 
-  const unvalidatedSecretConfig = emailProvider.secret?.configValue;
-
-  if (!unvalidatedSecretConfig) {
-    return err({
-      type: InternalEventType.BadWorkspaceConfiguration,
-      variant: {
-        type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-        message:
-          "Missing messaging service provider config. Configure in settings.",
-      },
-    });
-  }
-
-  const secretConfigResult = schemaValidateWithErr(
-    emailProvider.secret?.configValue,
-    EmailProviderSecret,
-  );
-  if (secretConfigResult.isErr()) {
-    logger().error(
-      {
-        err: secretConfigResult.error,
-        unvalidatedSecretConfig,
-      },
-      "message service provider config malformed",
-    );
-    return err({
-      type: InternalEventType.BadWorkspaceConfiguration,
-      variant: {
-        type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-        message:
-          "Application error: message service provider config malformed.",
-      },
-    });
-  }
-  const secretConfig = secretConfigResult.value;
   let attachments: Attachment[] | undefined;
   if (
     messageTemplateDefinition.attachmentUserProperties?.length &&
@@ -842,7 +1022,7 @@ export async function sendEmail({
       messageTemplateDefinition.attachmentUserProperties.map(
         async (attachmentProperty) => {
           const assignment = userPropertyAssignments[attachmentProperty];
-          const file = schemaValidateWithErr(assignment, BlobStorageFile);
+          const file = schemaValidateWithErr(assignment, AppDataFileInternal);
           if (file.isErr()) {
             logger().error(
               {
@@ -857,26 +1037,44 @@ export async function sendEmail({
             return [];
           }
 
-          const { name, key, mimeType } = file.value;
-          const object = await getObject(s, {
-            key,
-          });
-          if (!object) {
-            logger().error(
-              {
-                key,
-                workspaceId,
-                mimeType,
-                name,
-                templateId,
-              },
-              "error getting attachment object",
-            );
-            return [];
+          const { name, mimeType } = file.value;
+          let data: string;
+
+          switch (file.value.type) {
+            case AppFileType.Base64Encoded: {
+              // For Base64EncodedFile, use the data directly
+              data = file.value.data;
+              break;
+            }
+            case AppFileType.BlobStorage: {
+              // For BlobStorageFile, fetch from storage
+              const object = await getObject(s, {
+                key: file.value.key,
+              });
+              if (!object) {
+                logger().error(
+                  {
+                    key: file.value.key,
+                    workspaceId,
+                    mimeType,
+                    name,
+                    templateId,
+                  },
+                  "error getting attachment object",
+                );
+                return [];
+              }
+              data = object.text;
+              break;
+            }
+            default: {
+              assertUnreachable(file.value);
+            }
           }
+
           const attachment: Attachment = {
             mimeType,
-            data: object.text,
+            data,
             name,
           };
           return attachment;
@@ -891,18 +1089,14 @@ export async function sendEmail({
     mimeType,
   }));
 
+  if (emailProviderResult.isErr()) {
+    return err(emailProviderResult.error);
+  }
+  const emailProvider = emailProviderResult.value;
+
   switch (emailProvider.type) {
     case EmailProviderType.Smtp: {
-      if (secretConfig.type !== EmailProviderType.Smtp) {
-        return err({
-          type: InternalEventType.BadWorkspaceConfiguration,
-          variant: {
-            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `expected smtp secret config but got ${secretConfig.type}`,
-          },
-        });
-      }
-      const { host, port } = secretConfig;
+      const { host, port } = emailProvider;
       if (!host) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
@@ -931,7 +1125,7 @@ export async function sendEmail({
         }));
 
       const result = await sendMailSmtp({
-        ...secretConfig,
+        ...emailProvider,
         from,
         to,
         subject,
@@ -975,17 +1169,7 @@ export async function sendEmail({
         },
       });
     }
-    case EmailProviderType.Sendgrid: {
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      if (secretConfig.type !== EmailProviderType.Sendgrid) {
-        return err({
-          type: InternalEventType.BadWorkspaceConfiguration,
-          variant: {
-            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `expected sendgrid secret config but got ${secretConfig.type}`,
-          },
-        });
-      }
+    case EmailProviderType.SendGrid: {
       const sendgridAttachments: MailDataRequired["attachments"] =
         messageTags &&
         attachments?.map((attachment) => ({
@@ -1017,7 +1201,7 @@ export async function sendEmail({
         },
       };
 
-      if (!secretConfig.apiKey) {
+      if (!emailProvider.apiKey) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
           variant: {
@@ -1029,7 +1213,7 @@ export async function sendEmail({
 
       const result = await sendMailSendgrid({
         mailData,
-        apiKey: secretConfig.apiKey,
+        apiKey: emailProvider.apiKey,
       });
 
       if (result.isErr()) {
@@ -1038,7 +1222,7 @@ export async function sendEmail({
           variant: {
             type: ChannelType.Email,
             provider: {
-              type: EmailProviderType.Sendgrid,
+              type: EmailProviderType.SendGrid,
               // Necessary because the types on sendgrid's lib are wrong
               body: JSON.stringify(result.error.response.body),
               status: result.error.code,
@@ -1061,32 +1245,29 @@ export async function sendEmail({
           name: emailName,
           attachments: attachmentsSent,
           provider: {
-            type: EmailProviderType.Sendgrid,
+            type: EmailProviderType.SendGrid,
           },
         },
       });
     }
     case EmailProviderType.AmazonSes: {
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      if (secretConfig.type !== EmailProviderType.AmazonSes) {
-        return err({
-          type: InternalEventType.BadWorkspaceConfiguration,
-          variant: {
-            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `expected amazon secret config but got ${secretConfig.type}`,
-          },
-        });
-      }
+      const sesAttachments = attachments?.map((attachment) => ({
+        filename: attachment.name,
+        content: attachment.data,
+        contentType: attachment.mimeType,
+      }));
+
+      const fromWithName = emailName ? `${emailName} <${from}>` : from;
       const mailData: SesMailData = {
         to,
-        from,
-        name: emailName,
+        from: fromWithName,
         subject,
         html: body,
         replyTo,
         cc,
         bcc,
         headers,
+        attachments: sesAttachments,
         tags: {
           workspaceId,
           templateId,
@@ -1095,9 +1276,9 @@ export async function sendEmail({
       };
 
       if (
-        !secretConfig.accessKeyId ||
-        !secretConfig.secretAccessKey ||
-        !secretConfig.region
+        !emailProvider.accessKeyId ||
+        !emailProvider.secretAccessKey ||
+        !emailProvider.region
       ) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
@@ -1111,20 +1292,37 @@ export async function sendEmail({
       const result = await sendMailAmazonSes({
         mailData,
         config: {
-          accessKeyId: secretConfig.accessKeyId,
-          secretAccessKey: secretConfig.secretAccessKey,
-          region: secretConfig.region,
+          accessKeyId: emailProvider.accessKeyId,
+          secretAccessKey: emailProvider.secretAccessKey,
+          region: emailProvider.region,
         },
       });
 
       if (result.isErr()) {
+        let message: string | undefined;
+        if (result.error instanceof SESv2ServiceException) {
+          message = result.error.message;
+        } else if (result.error instanceof Error) {
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+          message = result.error.message;
+        } else {
+          logger().error(
+            {
+              err: result.error,
+              workspaceId,
+              messageId: messageTags?.messageId,
+            },
+            "Unknown error sending email",
+          );
+          message = "Unknown error";
+        }
         return err({
           type: InternalEventType.MessageFailure,
           variant: {
             type: ChannelType.Email,
             provider: {
               type: EmailProviderType.AmazonSes,
-              message: result.error.message,
+              message,
             },
           },
         });
@@ -1149,18 +1347,76 @@ export async function sendEmail({
       });
     }
 
-    case EmailProviderType.Resend: {
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      if (secretConfig.type !== EmailProviderType.Resend) {
+    case EmailProviderType.Gmail: {
+      if (!emailProvider.accessToken) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
           variant: {
             type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `expected resend secret config but got ${secretConfig.type}`,
+            message: "Failed to get or refresh Gmail access token",
           },
         });
       }
 
+      const overriddenFrom = emailName
+        ? `${emailName} <${emailProvider.email}>`
+        : emailProvider.email;
+
+      const gmailAttachments: SendGmailEmailParams["attachments"] =
+        attachments?.map((attachment) => ({
+          filename: attachment.name,
+          content: attachment.data,
+          contentType: attachment.mimeType,
+        }));
+
+      const gmailResult = await sendGmailEmail({
+        accessToken: emailProvider.accessToken,
+        params: {
+          to,
+          from: overriddenFrom,
+          subject,
+          bodyHtml: body,
+          replyTo,
+          cc,
+          bcc,
+          headers,
+          attachments: gmailAttachments,
+        },
+      });
+
+      if (gmailResult.isErr()) {
+        return err({
+          type: InternalEventType.MessageFailure,
+          variant: {
+            type: ChannelType.Email,
+            provider: gmailResult.error,
+          },
+        });
+      }
+      return ok({
+        type: InternalEventType.MessageSent,
+        variant: {
+          type: ChannelType.Email,
+          from: overriddenFrom,
+          body,
+          to,
+          subject,
+          headers,
+          replyTo,
+          cc: unsplitCc,
+          bcc: unsplitBcc,
+          name: emailName,
+          attachments: attachmentsSent,
+          provider: {
+            type: EmailProviderType.Gmail,
+            messageId: gmailResult.value.messageId,
+            threadId: gmailResult.value.threadId,
+          },
+        },
+      });
+    }
+
+    case EmailProviderType.Resend: {
       const resendAttachments: ResendRequiredData["attachments"] =
         attachments?.map((attachment) => ({
           filename: attachment.name,
@@ -1185,7 +1441,7 @@ export async function sendEmail({
         attachments: resendAttachments,
       };
 
-      if (!secretConfig.apiKey) {
+      if (!emailProvider.apiKey) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
           variant: {
@@ -1197,7 +1453,7 @@ export async function sendEmail({
 
       const result = await sendMailResend({
         mailData,
-        apiKey: secretConfig.apiKey,
+        apiKey: emailProvider.apiKey,
       });
 
       if (result.isErr()) {
@@ -1234,17 +1490,6 @@ export async function sendEmail({
       });
     }
     case EmailProviderType.PostMark: {
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      if (secretConfig.type !== EmailProviderType.PostMark) {
-        return err({
-          type: InternalEventType.BadWorkspaceConfiguration,
-          variant: {
-            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `expected postmark secret config but got ${secretConfig.type}`,
-          },
-        });
-      }
-
       const postmarkAttachments: PostMarkRequiredFields["Attachments"] =
         messageTags
           ? attachments?.map(({ mimeType, data, name }) => ({
@@ -1258,6 +1503,11 @@ export async function sendEmail({
             }))
           : [];
       const fromWithName = emailName ? `${emailName} <${from}>` : from;
+      const baseMetadata = R.merge(messageTags, {
+        workspaceId,
+        templateId,
+      });
+      const metadata = R.pick(baseMetadata, MESSAGE_METADATA_FIELDS);
       const mailData: PostMarkRequiredFields = {
         To: to,
         From: fromWithName,
@@ -1274,16 +1524,10 @@ export async function sendEmail({
                 Value: value,
               }))
             : undefined,
-        Metadata: {
-          recipient: to,
-          from,
-          workspaceId,
-          templateId,
-          ...messageTags,
-        },
+        Metadata: metadata,
       };
 
-      if (!secretConfig.apiKey) {
+      if (!emailProvider.apiKey) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
           variant: {
@@ -1295,7 +1539,7 @@ export async function sendEmail({
 
       const result = await sendMailPostMark({
         mailData,
-        apiKey: secretConfig.apiKey,
+        apiKey: emailProvider.apiKey,
       });
 
       if (result.isErr()) {
@@ -1379,17 +1623,7 @@ export async function sendEmail({
         metadata,
       };
 
-      if (secretConfig.type !== EmailProviderType.MailChimp) {
-        return err({
-          type: InternalEventType.BadWorkspaceConfiguration,
-          variant: {
-            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `expected mailchimp secret config but got ${secretConfig.type}`,
-          },
-        });
-      }
-
-      if (!secretConfig.apiKey) {
+      if (!emailProvider.apiKey) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
           variant: {
@@ -1400,7 +1634,7 @@ export async function sendEmail({
       }
 
       const result = await sendMailMailchimp({
-        apiKey: secretConfig.apiKey,
+        apiKey: emailProvider.apiKey,
         message: mailData,
       });
 
@@ -1491,6 +1725,7 @@ export async function sendSms(
     userId,
     messageTags,
     disableCallback = false,
+    isPreview,
   } = params;
   const [getSendModelsResult, smsProvider] = await Promise.all([
     getSendMessageModels({
@@ -1552,6 +1787,7 @@ export async function sendSms(
     subscriptionGroupId: subscriptionGroupDetails?.id,
     workspaceId,
     tags: messageTags,
+    isPreview,
     templates: {
       body: {
         contents: messageTemplateDefinition.body,
@@ -1614,44 +1850,86 @@ export async function sendSms(
         });
       }
 
-      const { accountSid, authToken, messagingServiceSid } = configResult.value;
+      const {
+        accountSid,
+        authToken,
+        messagingServiceSid,
+        apiKeySid,
+        apiKeySecret,
+      } = configResult.value;
 
-      if (!accountSid || !authToken || !messagingServiceSid) {
+      if (!accountSid) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
           variant: {
             type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `missing accountSid, authToken, or messagingServiceSid in sms provider config`,
+            message: `missing accountSid in sms provider config`,
           },
         });
       }
-      let sender: TwilioSender;
-      const { senderOverride } = params;
-      if (providerOverride === SmsProviderType.Twilio && senderOverride) {
-        switch (senderOverride.type) {
+      let auth: TwilioAuth;
+      if (apiKeySid && apiKeySecret) {
+        auth = {
+          type: "apiKey",
+          apiKeySid,
+          apiKeySecret,
+        };
+      } else if (authToken) {
+        auth = {
+          type: "authToken",
+          authToken,
+        };
+      } else {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message:
+              "twilio auth must provider either an auth token or api key sid and secret",
+          },
+        });
+      }
+
+      let senderOverride: TwilioSender | null = null;
+      if (
+        params.providerOverride === SmsProviderType.Twilio &&
+        params.senderOverride
+      ) {
+        switch (params.senderOverride.type) {
           case TwilioSenderOverrideType.MessageSid:
-            sender = {
-              messagingServiceSid: senderOverride.messagingServiceSid,
+            senderOverride = {
+              messagingServiceSid: params.senderOverride.messagingServiceSid,
             };
             break;
           case TwilioSenderOverrideType.PhoneNumber:
-            sender = {
-              from: senderOverride.phone,
+            senderOverride = {
+              from: params.senderOverride.phone,
             };
             break;
-          default:
-            assertUnreachable(senderOverride);
         }
-      } else {
+      }
+      let sender: TwilioSender;
+      if (senderOverride) {
+        sender = senderOverride;
+      } else if (messagingServiceSid) {
         sender = {
           messagingServiceSid,
         };
+      } else {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message:
+              "twilio sender must provide either a messaging service sid or a sender override",
+          },
+        });
       }
 
       const result = await sendSmsTwilio({
         body,
         accountSid,
-        authToken,
+        auth,
         userId,
         subscriptionGroupId: subscriptionGroupDetails?.id,
         to,
@@ -1686,6 +1964,114 @@ export async function sendSms(
         },
       });
     }
+    case SmsProviderType.SignalWire: {
+      const configResult = schemaValidateWithErr(
+        parsedConfigResult.value,
+        SignalWireSecret,
+      );
+      if (configResult.isErr()) {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message: configResult.error.message,
+          },
+        });
+      }
+
+      const { project, token, spaceUrl, phone } = configResult.value;
+
+      if (!project) {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message: `missing project in SignalWire provider config`,
+          },
+        });
+      }
+
+      if (!token) {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message: `missing token in SignalWire provider config`,
+          },
+        });
+      }
+
+      if (!spaceUrl) {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message: `missing spaceUrl in SignalWire provider config`,
+          },
+        });
+      }
+
+      let phoneOverride: string | null = null;
+      if (
+        params.providerOverride === SmsProviderType.SignalWire &&
+        params.senderOverride
+      ) {
+        switch (params.senderOverride.type) {
+          case SignalWireSenderOverrideType.PhoneNumber:
+            phoneOverride = params.senderOverride.phone;
+        }
+      }
+      let from: string;
+      if (phoneOverride) {
+        from = phoneOverride;
+      } else if (phone) {
+        from = phone;
+      } else {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message:
+              "SignalWire sender requires a default phone number or a sender override phone number",
+          },
+        });
+      }
+
+      const result = await sendSmsSignalWire({
+        project,
+        token,
+        spaceUrl,
+        body,
+        to,
+        from,
+        tags: messageTags,
+        disableCallback,
+      });
+
+      if (result.isErr()) {
+        return err({
+          type: InternalEventType.MessageFailure,
+          variant: {
+            type: ChannelType.Sms,
+            provider: result.error,
+          },
+        });
+      }
+
+      return ok({
+        type: InternalEventType.MessageSent,
+        variant: {
+          type: ChannelType.Sms,
+          body,
+          to,
+          provider: {
+            type: SmsProviderType.SignalWire,
+            sid: result.value.sid,
+            status: result.value.status,
+          },
+        },
+      });
+    }
     case SmsProviderType.Test:
       return ok({
         type: InternalEventType.MessageSent,
@@ -1716,6 +2102,7 @@ export async function sendWebhook({
   subscriptionGroupDetails,
   useDraft,
   messageTags,
+  isPreview,
 }: Omit<
   SendMessageParametersWebhook,
   "channel"
@@ -1744,6 +2131,16 @@ export async function sendWebhook({
   const parsedConfigResult: Record<string, string> = secret?.configValue
     ? schemaValidateWithErr(secret.configValue, WebhookSecret)
         .map((c) => R.omit(c, ["type"]))
+        .mapErr((e) => {
+          logger().error(
+            {
+              ...messageTags,
+              err: e,
+            },
+            "failed to parse webhook secret",
+          );
+          return e;
+        })
         .unwrapOr({})
     : {};
 
@@ -1770,6 +2167,7 @@ export async function sendWebhook({
     workspaceId,
     secrets,
     tags: messageTags,
+    isPreview,
     templates: {
       body: {
         contents: messageTemplateDefinition.body,
@@ -1794,7 +2192,7 @@ export async function sendWebhook({
       variant: {
         type: BadWorkspaceConfigurationType.MessageTemplateRenderError,
         field: "body",
-        error: `Failed to parse webhook json payload: ${parsedBody.error.message}`,
+        error: "Failed to parse webhook json payload",
       },
     });
   }
@@ -1809,7 +2207,7 @@ export async function sendWebhook({
       variant: {
         type: BadWorkspaceConfigurationType.MessageTemplateRenderError,
         field: "body",
-        error: `Failed to validate webhook json payload: ${validatedBody.error.message}`,
+        error: `Failed to validate webhook json payload`,
       },
     });
   }
@@ -1861,7 +2259,7 @@ export async function sendWebhook({
       renderedSecret?.responseType ?? renderedConfig.responseType;
     const url = renderedSecret?.url ?? renderedConfig.url;
 
-    const response = await axios({
+    const response = await axios.request({
       url,
       method,
       params,
@@ -1869,6 +2267,11 @@ export async function sendWebhook({
       responseType,
       headers: renderedHeaders,
     });
+
+    const axiosHeaders =
+      response.headers instanceof AxiosHeaders
+        ? response.headers.toJSON()
+        : response.headers;
 
     return ok({
       type: InternalEventType.MessageSent,
@@ -1881,7 +2284,7 @@ export async function sendWebhook({
         } satisfies WebhookConfig,
         response: {
           status: response.status,
-          headers: response.headers as Record<string, string> | undefined,
+          headers: axiosHeaders as WebhookResponse["headers"] | undefined,
           body: response.data,
         } satisfies WebhookResponse,
       } satisfies MessageWebhookSuccess,
@@ -1915,6 +2318,13 @@ export type Sender = (
   params: SendMessageParameters,
 ) => Promise<BackendMessageSendResult>;
 
+/**
+ * Send a message to a channel
+ * Re-tryable errors will be thrown. Non-retryable errors will be returned as
+ * error objects.
+ * @param params - The parameters for the message
+ * @returns The result of the message send
+ */
 export async function sendMessage(
   params: SendMessageParameters,
 ): Promise<BackendMessageSendResult> {
@@ -1938,4 +2348,421 @@ export async function sendMessage(
         return sendWebhook(params);
     }
   });
+}
+
+export async function testTemplate(
+  request: MessageTemplateTestRequest,
+): Promise<BackendMessageSendResult> {
+  // Look up the first subscription group for the template's channel
+  const messageTemplate = await db().query.messageTemplate.findFirst({
+    where: eq(dbMessageTemplate.id, request.templateId),
+  });
+
+  let firstSubscriptionGroup:
+    | { id: string; name: string; type: "OptIn" | "OptOut" }
+    | undefined;
+  if (messageTemplate) {
+    firstSubscriptionGroup = await db().query.subscriptionGroup.findFirst({
+      where: and(
+        eq(dbSubscriptionGroup.workspaceId, request.workspaceId),
+        eq(dbSubscriptionGroup.channel, request.channel),
+      ),
+      orderBy: dbSubscriptionGroup.createdAt,
+      columns: { id: true, name: true, type: true },
+    });
+  }
+  const messageTags: MessageTags = {
+    ...(request.tags ?? {}),
+    messageId: request.tags?.messageId ?? randomUUID(),
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const userId = request.userProperties.id;
+  if (typeof userId === "string") {
+    messageTags.userId = userId;
+  }
+  const baseSendMessageParams: Omit<
+    SendMessageParameters,
+    "provider" | "channel"
+  > = {
+    workspaceId: request.workspaceId,
+    templateId: request.templateId,
+    userId: messageTags.userId ?? "test-user",
+    userPropertyAssignments: request.userProperties,
+    useDraft: true,
+    messageTags,
+    isPreview: true,
+    ...(firstSubscriptionGroup && {
+      subscriptionGroupDetails: {
+        id: firstSubscriptionGroup.id,
+        name: firstSubscriptionGroup.name,
+        action: SubscriptionChange.Subscribe,
+        type:
+          firstSubscriptionGroup.type === "OptIn"
+            ? SubscriptionGroupType.OptIn
+            : SubscriptionGroupType.OptOut,
+      },
+    }),
+  };
+  let sendMessageParams: SendMessageParameters;
+  switch (request.channel) {
+    case ChannelType.Email: {
+      sendMessageParams = {
+        ...baseSendMessageParams,
+        channel: request.channel,
+        providerOverride: request.provider,
+      };
+      break;
+    }
+    case ChannelType.Sms: {
+      sendMessageParams = {
+        ...baseSendMessageParams,
+        providerOverride: request.provider,
+        channel: request.channel,
+        disableCallback: true,
+      };
+      break;
+    }
+    case ChannelType.MobilePush: {
+      sendMessageParams = {
+        ...baseSendMessageParams,
+        provider: request.provider,
+        channel: request.channel,
+      };
+      break;
+    }
+    case ChannelType.Webhook: {
+      sendMessageParams = {
+        ...baseSendMessageParams,
+        channel: request.channel,
+      };
+      break;
+    }
+    default:
+      assertUnreachable(request);
+  }
+  return sendMessage(sendMessageParams);
+}
+
+export function isNonRetryableError(
+  error: MessageSendFailure,
+): error is NonRetryableMessageSendFailure {
+  switch (error.type) {
+    case InternalEventType.MessageFailure:
+      return true;
+    case InternalEventType.BadWorkspaceConfiguration:
+      return true;
+    case InternalEventType.MessageSkipped:
+      return false;
+    default:
+      assertUnreachable(error);
+  }
+}
+
+type MessageSendResultWithResponseItem = [
+  BatchMessageUsersResult,
+  BackendMessageSendResult | null,
+];
+
+export async function batchMessageUsers(
+  params: BatchMessageUsersRequest,
+): Promise<BatchMessageUsersResponse> {
+  const { workspaceId, templateId, subscriptionGroupId, users } = params;
+
+  // Collect all user IDs for bulk operations
+  const userIds = users.map((user) => user.id);
+
+  // Get subscription group details and user property assignments for all users in parallel
+  const [subscriptionGroupData, usersResult] = await Promise.all([
+    subscriptionGroupId
+      ? getSubscriptionGroupsWithAssignments({
+          workspaceId,
+          subscriptionGroupIds: [subscriptionGroupId],
+          userIds,
+        })
+      : Promise.resolve([]),
+
+    // Use batched getUsers to get user property assignments for all users at once
+    getUsers({
+      workspaceId,
+      userIds,
+      limit: userIds.length, // Get all users in one batch
+    }),
+  ]);
+
+  // Handle the result from getUsers
+  if (usersResult.isErr()) {
+    throw usersResult.error;
+  }
+
+  // Create lookup maps
+  const subscriptionGroupMap = new Map(
+    subscriptionGroupData.map((subscriptionGroupWithAssignment) => [
+      subscriptionGroupWithAssignment.userId,
+      subscriptionGroupWithAssignment,
+    ]),
+  );
+
+  // Convert getUsers response to UserPropertyAssignments format
+  const userPropertiesMap = new Map(
+    usersResult.value.users.map((user) => {
+      // Convert properties from getUsers format to UserPropertyAssignments format
+      const assignments: UserPropertyAssignments = {};
+      for (const [propertyId, property] of Object.entries(user.properties)) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        assignments[propertyId] = property.value;
+      }
+      return [user.id, assignments];
+    }),
+  );
+
+  // Process each user and send messages
+  const messagePromises: Promise<MessageSendResultWithResponseItem>[] =
+    users.map(async (user) => {
+      const messageId = user.messageId ?? randomUUID();
+
+      try {
+        // Get subscription group details for this user
+        let subscriptionGroupDetails:
+          | (SubscriptionGroupDetails & { name: string })
+          | undefined;
+
+        if (subscriptionGroupId) {
+          const subscriptionGroupWithAssignment = subscriptionGroupMap.get(
+            user.id,
+          );
+          if (subscriptionGroupWithAssignment) {
+            const details = getSubscriptionGroupDetails(
+              subscriptionGroupWithAssignment,
+            );
+            subscriptionGroupDetails = {
+              name: subscriptionGroupWithAssignment.name,
+              ...details,
+            };
+          }
+        }
+
+        // Get base user property assignments and merge with request properties
+        const baseUserPropertyAssignments =
+          userPropertiesMap.get(user.id) ?? {};
+        const combinedUserPropertyAssignments = {
+          ...baseUserPropertyAssignments,
+          ...user.properties,
+          id: user.id, // Ensure the user ID is always available for liquid templates
+        };
+
+        // Create message tags
+        const messageTags: MessageTags = {
+          messageId,
+          workspaceId,
+          templateId,
+          userId: user.id,
+        };
+
+        // Prepare send message parameters based on channel type
+        let sendMessageParams: SendMessageParameters;
+
+        switch (params.channel) {
+          case ChannelType.Email: {
+            sendMessageParams = {
+              workspaceId,
+              templateId,
+              userId: user.id,
+              userPropertyAssignments: combinedUserPropertyAssignments,
+              subscriptionGroupDetails,
+              messageTags,
+              useDraft: false,
+              channel: params.channel,
+              providerOverride: params.provider,
+            };
+            break;
+          }
+          case ChannelType.Sms: {
+            sendMessageParams = {
+              workspaceId,
+              templateId,
+              userId: user.id,
+              userPropertyAssignments: combinedUserPropertyAssignments,
+              subscriptionGroupDetails,
+              messageTags,
+              useDraft: false,
+              channel: params.channel,
+              providerOverride: params.provider,
+            };
+            break;
+          }
+          case ChannelType.Webhook: {
+            sendMessageParams = {
+              workspaceId,
+              templateId,
+              userId: user.id,
+              userPropertyAssignments: combinedUserPropertyAssignments,
+              subscriptionGroupDetails,
+              messageTags,
+              useDraft: false,
+              channel: params.channel,
+            };
+            break;
+          }
+          default:
+            assertUnreachable(params);
+        }
+
+        // Send the message
+        const messageResult = await sendMessage(sendMessageParams);
+
+        // Process the result
+        if (messageResult.isOk()) {
+          switch (messageResult.value.type) {
+            case InternalEventType.MessageSent:
+              return [
+                {
+                  userId: user.id,
+                  type: BatchMessageUsersResultTypeEnum.Success,
+                  messageId,
+                },
+                messageResult,
+              ] satisfies MessageSendResultWithResponseItem;
+            case InternalEventType.MessageSkipped:
+              return [
+                {
+                  userId: user.id,
+                  type: BatchMessageUsersResultTypeEnum.Skipped,
+                  messageId,
+                  reason: messageResult.value.message || "Message was skipped",
+                },
+                messageResult,
+              ] satisfies MessageSendResultWithResponseItem;
+            default:
+              assertUnreachable(messageResult.value);
+          }
+        } else {
+          const { error } = messageResult;
+          if (isNonRetryableError(error)) {
+            return [
+              {
+                userId: user.id,
+                type: BatchMessageUsersResultTypeEnum.NonRetryableError,
+                messageId,
+                error,
+              },
+              messageResult,
+            ] satisfies MessageSendResultWithResponseItem;
+          }
+          let errorMessage: string;
+          switch (error.variant.type) {
+            case MessageSkippedType.MissingIdentifier:
+              errorMessage = `Missing identifier: ${error.variant.identifierKey}`;
+              break;
+            case MessageSkippedType.SubscriptionState:
+              errorMessage =
+                "User does not satisfy subscription group requirements";
+              break;
+            default:
+              assertUnreachable(error.variant);
+          }
+          return [
+            {
+              userId: user.id,
+              type: BatchMessageUsersResultTypeEnum.RetryableError,
+              messageId,
+              error: {
+                message: errorMessage,
+              },
+            },
+            messageResult,
+          ] satisfies MessageSendResultWithResponseItem;
+        }
+      } catch (userError) {
+        logger().info(
+          {
+            err: userError,
+            userId: user.id,
+            workspaceId,
+            templateId,
+          },
+          "Failed to send message to user",
+        );
+
+        return [
+          {
+            userId: user.id,
+            type: BatchMessageUsersResultTypeEnum.RetryableError,
+            messageId,
+            error: {
+              message:
+                userError instanceof Error
+                  ? userError.message
+                  : "Unknown error",
+            },
+          },
+          null,
+        ] satisfies MessageSendResultWithResponseItem;
+      }
+    });
+
+  // Wait for all messages to be processed
+  const messageResults = await Promise.all(messagePromises);
+
+  const results: BatchMessageUsersResponse["results"] = messageResults.map(
+    (r) => r[0],
+  );
+
+  // Create a mapping from userId to user context for event tracking
+  const userContextMap = new Map(users.map((user) => [user.id, user.context]));
+
+  const baseProperties: TrackData["properties"] = {
+    templateId,
+    workspaceId,
+  };
+  const trackEvents: KnownBatchTrackData[] = messageResults.flatMap(
+    ([responseResult, backendMessageSendResult]) => {
+      if (!backendMessageSendResult) {
+        return [];
+      }
+      if (
+        responseResult.type === BatchMessageUsersResultTypeEnum.RetryableError
+      ) {
+        return [];
+      }
+      let event: InternalEventType;
+      let trackingProperties: TrackData["properties"];
+      const { messageId, userId } = responseResult;
+      if (backendMessageSendResult.isOk()) {
+        event = backendMessageSendResult.value.type;
+        trackingProperties = {
+          ...baseProperties,
+          ...omit(backendMessageSendResult.value, ["type"]),
+        };
+      } else {
+        event = backendMessageSendResult.error.type;
+        trackingProperties = {
+          ...baseProperties,
+          ...omit(backendMessageSendResult.error, ["type"]),
+        };
+      }
+
+      // Get user-specific context
+      const userContext = userContextMap.get(userId);
+
+      return {
+        type: EventType.Track,
+        properties: trackingProperties,
+        messageId,
+        userId,
+        event,
+        context: userContext,
+      };
+    },
+  );
+
+  await submitBatch({
+    workspaceId,
+    data: {
+      batch: trackEvents,
+      context: params.context,
+    },
+  });
+
+  return { results };
 }

@@ -13,7 +13,7 @@ import {
 import logger, { publicLogger } from "./logger";
 import { getMeter } from "./openTelemetry";
 import {
-  ComputedPropertyStep,
+  ComputedPropertyStepEnum,
   Workspace,
   WorkspaceStatusDbEnum,
   WorkspaceTypeAppEnum,
@@ -46,6 +46,10 @@ function observeWorkspaceComputeLatencyInner({
 
   const histogram = getMeter().createHistogram(
     WORKSPACE_COMPUTE_LATENCY_METRIC,
+    {
+      description: "Workspace compute latency",
+      unit: "ms",
+    },
   );
   const { appVersion } = config();
 
@@ -130,7 +134,10 @@ async function emitPublicSignals({ workspaces }: { workspaces: Workspace[] }) {
     messageCounts.push([row.workspace_id, count]);
   }
 
-  const firstWorkspace = workspaces[0]?.id;
+  // Sort workspaces by createdAt and take the first ID
+  const firstWorkspace = workspaces
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+    .at(0)?.id;
 
   for (const [workspaceId, count] of userCounts) {
     publicLogger().info(
@@ -162,7 +169,7 @@ export async function findActiveWorkspaces(): Promise<{
     .innerJoin(w, eq(cpp.workspaceId, w.id))
     .where(
       and(
-        eq(cpp.step, ComputedPropertyStep.ComputeAssignments),
+        eq(cpp.step, ComputedPropertyStepEnum.ComputeAssignments),
         eq(w.status, WorkspaceStatusDbEnum.Active),
         not(eq(w.type, WorkspaceTypeAppEnum.Parent)),
         or(

@@ -1,7 +1,12 @@
 import backendConfig from "backend-lib/src/config";
 import logger from "backend-lib/src/logger";
 import { getRequestContext, SESSION_KEY } from "backend-lib/src/requestContext";
-import { OpenIdProfile, RequestContextErrorType } from "backend-lib/src/types";
+import {
+  DBWorkspaceOccupantType,
+  EmbeddedSession,
+  OpenIdProfile,
+  RequestContextErrorType,
+} from "backend-lib/src/types";
 import { FastifyInstance, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 
@@ -25,6 +30,7 @@ export function getRequestContextFastify(request: FastifyRequest) {
     ...request.headers,
     ...requestToSessionValue(request),
   };
+  // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
   const { user: profile } = request as { user?: OpenIdProfile };
   return getRequestContext(headers, profile);
 }
@@ -89,3 +95,35 @@ const requestContext = fp(async (fastify: FastifyInstance) => {
 });
 
 export default requestContext;
+
+export function getOccupantFromRequest(request: FastifyRequest): {
+  workspaceOccupantId: string;
+  workspaceOccupantType: DBWorkspaceOccupantType;
+} | null {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+  const { embeddedSession } = request.raw as {
+    embeddedSession?: EmbeddedSession;
+  };
+  if (backendConfig().authMode === "anonymous") {
+    return {
+      workspaceOccupantId: "anonymous",
+      workspaceOccupantType: "WorkspaceMember",
+    };
+  }
+
+  if (embeddedSession?.occupantId) {
+    return {
+      workspaceOccupantId: embeddedSession.occupantId,
+      workspaceOccupantType: "ChildWorkspaceOccupant",
+    };
+  }
+
+  const member = request.requestContext.get("member");
+  if (member) {
+    return {
+      workspaceOccupantId: member.id,
+      workspaceOccupantType: "WorkspaceMember",
+    };
+  }
+  return null;
+}

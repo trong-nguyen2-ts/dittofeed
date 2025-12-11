@@ -1,5 +1,8 @@
 /* eslint-disable @typescript-eslint/no-loop-func */
 /* eslint-disable no-await-in-loop */
+import type { InspectOptions } from "node:util";
+import { inspect } from "node:util";
+
 import { randomUUID } from "crypto";
 import { format } from "date-fns";
 import { utcToZonedTime } from "date-fns-tz";
@@ -9,6 +12,14 @@ import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 import { assertUnreachable } from "isomorphic-lib/src/typeAssertions";
 import { omit } from "remeda";
 
+import {
+  getUserCounts,
+  IndexedState,
+  readAssignments,
+  readIndexed,
+  readPeriods,
+  readUpdatedComputedPropertyState,
+} from "../../test/computeProperties";
 import { submitBatch, TestEvent } from "../../test/testEvents";
 import {
   clickhouseClient,
@@ -21,11 +32,21 @@ import { toJourneyResource } from "../journeys";
 import logger from "../logger";
 import { findAllSegmentAssignments, toSegmentResource } from "../segments";
 import {
+  getSubscriptionGroupSegmentName,
+  getUserSubscriptions,
+  subscriptionGroupToResource,
+  upsertSubscriptionGroup,
+} from "../subscriptionGroups";
+import {
   AppFileType,
   BlobStorageFile,
-  ComputedPropertyAssignment,
+  ChannelType,
   ComputedPropertyStep,
+  ComputedPropertyStepEnum,
+  CursorDirectionEnum,
   EventType,
+  GetUsersRequest,
+  GetUsersResponseItem,
   InternalEventType,
   JourneyDefinition,
   JourneyNodeType,
@@ -34,7 +55,9 @@ import {
   PerformedUserPropertyDefinition,
   RelationalOperators,
   SavedHasStartedJourneyResource,
+  SavedJourneyResource,
   SavedSegmentResource,
+  SavedSubscriptionGroupResource,
   SavedUserPropertyResource,
   SegmentHasBeenOperatorComparator,
   SegmentNodeType,
@@ -42,7 +65,6 @@ import {
   SegmentResource,
   SubscriptionChange,
   SubscriptionChangeEvent,
-  SubscriptionGroupSegmentNode,
   SubscriptionGroupType,
   UserPropertyDefinitionType,
   UserPropertyOperatorType,
@@ -53,10 +75,9 @@ import {
   findAllUserPropertyAssignments,
   toSavedUserPropertyResource,
 } from "../userProperties";
+import { getUsers } from "../users";
+import type { ComputePropertiesArgs } from "./computePropertiesIncremental";
 import {
-  computeAssignments,
-  computeState,
-  processAssignments,
   segmentNodeStateId,
   userPropertyStateId,
 } from "./computePropertiesIncremental";
@@ -76,85 +97,6 @@ jest.mock("../temporal/activity", () => ({
     },
   }),
 }));
-
-async function getAssignmentUserCount(workspaceId: string) {
-  const qb = new ClickHouseQueryBuilder();
-  const query = `
-    select uniqExact(user_id) as user_count
-    from computed_property_assignments_v2
-    where workspace_id = ${qb.addQueryValue(workspaceId, "String")}
-  `;
-  const response = await clickhouseClient().query({
-    query,
-    query_params: qb.getQueries(),
-  });
-  const values: { data: { user_count: number }[] } = await response.json();
-  return Number(values.data[0]?.user_count ?? 0);
-}
-
-async function getStateUserCount(workspaceId: string) {
-  const qb = new ClickHouseQueryBuilder();
-  const query = `
-    select uniqExact(user_id) as user_count
-    from computed_property_state_v2
-    where workspace_id = ${qb.addQueryValue(workspaceId, "String")}
-  `;
-  const response = await clickhouseClient().query({
-    query,
-    query_params: qb.getQueries(),
-  });
-  const values: { data: { user_count: number }[] } = await response.json();
-  return Number(values.data[0]?.user_count ?? 0);
-}
-
-async function getEventsUserCount(workspaceId: string) {
-  const qb = new ClickHouseQueryBuilder();
-  const query = `
-    select uniqExact(user_id) as user_count
-    from user_events_v2
-    where workspace_id = ${qb.addQueryValue(workspaceId, "String")}
-  `;
-  const response = await clickhouseClient().query({
-    query,
-    query_params: qb.getQueries(),
-  });
-  const values: { data: { user_count: number }[] } = await response.json();
-  return Number(values.data[0]?.user_count ?? 0);
-}
-
-async function getUserCounts(workspaceId: string) {
-  const [stateUserCount, assignmentUserCount, eventsUserCount] =
-    await Promise.all([
-      getStateUserCount(workspaceId),
-      getAssignmentUserCount(workspaceId),
-      getEventsUserCount(workspaceId),
-    ]);
-  return {
-    eventsUserCount,
-    stateUserCount,
-    assignmentUserCount,
-  };
-}
-
-async function readAssignments({
-  workspaceId,
-}: {
-  workspaceId: string;
-}): Promise<ComputedPropertyAssignment[]> {
-  const qb = new ClickHouseQueryBuilder();
-  const query = `
-    select *
-    from computed_property_assignments_v2
-    where workspace_id = ${qb.addQueryValue(workspaceId, "String")}
-    order by assigned_at desc
-  `;
-  const response = await clickhouseClient().query({
-    query,
-    query_params: qb.getQueries(),
-  });
-  const values: { data: ComputedPropertyAssignment[] } = await response.json();
-  return values.data;
-}
 
 interface State {
   type: "segment" | "user_property";
@@ -181,6 +123,37 @@ interface DisaggregatedState {
   event_time: string;
 }
 
+function toTableUser(ctx: StepContext, user: GetUsersResponseItem): TableUser {
+  const tableUser: TableUser = {
+    id: user.id,
+  };
+
+  // Convert properties from Record<id, {name, value}> to Record<name, value>
+  if (Object.keys(user.properties).length > 0) {
+    tableUser.properties = {};
+    for (const { name, value } of Object.values(user.properties)) {
+      tableUser.properties[name] = value as JSONValue;
+    }
+  }
+
+  // Convert segments from Array<{id, name}> to Record<name, true>
+  if (user.segments.length > 0) {
+    tableUser.segments = {};
+    for (const segment of user.segments) {
+      tableUser.segments[segment.name] = true;
+    }
+  }
+
+  // Convert subscriptions from Array<{id, name, subscribed}> to Record<name, subscribed>
+  if (user.subscriptions && user.subscriptions.length > 0) {
+    tableUser.subscriptions = {};
+    for (const subscription of user.subscriptions) {
+      tableUser.subscriptions[subscription.name] = subscription.subscribed;
+    }
+  }
+
+  return tableUser;
+}
 async function readDisaggregatedStates({
   workspaceId,
 }: {
@@ -199,7 +172,7 @@ async function readDisaggregatedStates({
       groupArrayMerge(grouped_message_ids) as grouped_message_ids,
       computed_at,
       event_time
-    from computed_property_state_v2
+    from computed_property_state_v3
     where workspace_id = ${qb.addQueryValue(workspaceId, "String")}
     group by
       workspace_id,
@@ -238,7 +211,7 @@ async function readStates({
       groupArrayMerge(grouped_message_ids) as grouped_message_ids,
       max(computed_at),
       groupArray(event_time) as event_times
-    from computed_property_state_v2
+    from computed_property_state_v3
     where workspace_id = ${qb.addQueryValue(workspaceId, "String")}
     group by
       workspace_id,
@@ -264,14 +237,6 @@ interface TestState {
   lastValue?: string;
   uniqueCount?: number;
   maxEventTime?: string;
-}
-
-interface IndexedState {
-  type: "segment" | "user_property";
-  computed_property_id: string;
-  state_id: string;
-  user_id: string;
-  indexed_value: string;
 }
 
 interface TestIndexedState {
@@ -300,14 +265,15 @@ async function readResolvedSegmentStates({
   workspaceId,
 }: {
   workspaceId: string;
-}): Promise<ResolvedSegmentState[]> {
+}): Promise<(ResolvedSegmentState & { computed_at: string })[]> {
   const qb = new ClickHouseQueryBuilder();
   const query = `
     select
       segment_id,
       state_id,
       user_id,
-      segment_state_value
+      segment_state_value,
+      computed_at
     from resolved_segment_state
     where workspace_id = ${qb.addQueryValue(workspaceId, "String")}
   `;
@@ -316,7 +282,9 @@ async function readResolvedSegmentStates({
       query,
       query_params: qb.getQueries(),
     })
-  ).json()) satisfies { data: ResolvedSegmentState[] };
+  ).json()) satisfies {
+    data: (ResolvedSegmentState & { computed_at: string })[];
+  };
 
   return response.data;
 }
@@ -347,31 +315,6 @@ function toTestResolvedSegmentState(
     nodeId,
     segmentStateValue: resolvedSegmentState.segment_state_value,
   };
-}
-
-async function readIndexed({
-  workspaceId,
-}: {
-  workspaceId: string;
-}): Promise<IndexedState[]> {
-  const qb = new ClickHouseQueryBuilder();
-  const query = `
-    select
-      type,
-      computed_property_id,
-      state_id,
-      user_id,
-      indexed_value
-    from computed_property_state_index
-    where workspace_id = ${qb.addQueryValue(workspaceId, "String")}
-  `;
-  const response = (await (
-    await clickhouseClient().query({
-      query,
-      query_params: qb.getQueries(),
-    })
-  ).json()) satisfies { data: IndexedState[] };
-  return response.data;
 }
 
 function toTestIndexedState(
@@ -489,8 +432,12 @@ function toTestState(
 
 interface TableUser {
   id: string;
+  // map from name to value
   properties?: Record<string, JSONValue>;
+  // map from name to value
   segments?: Record<string, boolean | null>;
+  // map from name to value
+  subscriptions?: Record<string, boolean>;
 }
 
 enum EventsStepType {
@@ -501,12 +448,110 @@ enum EventsStepType {
   Sleep = "Sleep",
   Debug = "Debug",
   UpdateComputedProperty = "UpdateComputedProperty",
+  UpdateJourney = "UpdateJourney",
+  Delay = "Delay",
+}
+
+type ClickhouseModule = typeof import("../clickhouse");
+type CommandCallArgs = Parameters<ClickhouseModule["command"]>;
+type QueryCallArgs = Parameters<ClickhouseModule["query"]>;
+
+interface ClickhouseCommandCall {
+  params: CommandCallArgs[0];
+  options: Record<string, unknown> | undefined;
+}
+
+interface ClickhouseQueryCall {
+  params: QueryCallArgs[0];
+  options: Record<string, unknown> | undefined;
+}
+
+interface ClickhouseCounters {
+  commands: number;
+  queries: number;
+  commandCalls: ClickhouseCommandCall[];
+  queryCalls: ClickhouseQueryCall[];
+}
+
+const INSPECT_OPTIONS: InspectOptions = {
+  depth: 4,
+  breakLength: 120,
+  compact: false,
+};
+
+function sanitizeOptions(
+  options: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!options) {
+    return options;
+  }
+  const { clickhouseClient: _, ...rest } = options;
+  if (Object.keys(rest).length === 0) {
+    return undefined;
+  }
+  return rest;
+}
+
+function renderClickhouseCalls(
+  calls: ClickhouseCommandCall[] | ClickhouseQueryCall[],
+  type: "command" | "query",
+): string {
+  if (calls.length === 0) {
+    return `no ${type}s recorded`;
+  }
+  return calls
+    .map((call, index) => {
+      const lines: string[] = [`#${index + 1}`];
+      const params = call.params;
+      if (params && typeof params === "object") {
+        const { query, ...rest } = params as Record<string, unknown>;
+        if (typeof query === "string") {
+          lines.push(`query:\n${query}`);
+        } else if (query !== undefined) {
+          lines.push(`query: ${inspect(query, INSPECT_OPTIONS)}`);
+        }
+        if (Object.keys(rest).length > 0) {
+          lines.push(`params: ${inspect(rest, INSPECT_OPTIONS)}`);
+        }
+      } else {
+        lines.push(`params: ${inspect(params, INSPECT_OPTIONS)}`);
+      }
+      if (call.options !== undefined) {
+        lines.push(`options: ${inspect(call.options, INSPECT_OPTIONS)}`);
+      }
+      return lines.join("\n");
+    })
+    .join("\n\n");
+}
+
+function buildClickhouseExpectationMessage({
+  description,
+  expected,
+  actual,
+  type,
+  calls,
+}: {
+  description?: string;
+  expected: number;
+  actual: number;
+  type: "command" | "query";
+  calls: ClickhouseCommandCall[] | ClickhouseQueryCall[];
+}): string {
+  const prefix = description ? `${description} - ` : "";
+  const label =
+    type === "command"
+      ? "ClickHouse command count mismatch"
+      : "ClickHouse query count mismatch";
+  const renderedCalls = renderClickhouseCalls(calls, type);
+  return `${prefix}${label}\nExpected: ${expected}\nActual: ${actual}\nObserved calls:\n${renderedCalls}`;
 }
 
 interface StepContext {
   now: number;
   workspace: Workspace;
   segments: SavedSegmentResource[];
+  subscriptionGroups: SavedSubscriptionGroupResource[];
+  clickhouseCounters: ClickhouseCounters;
 }
 
 type EventBuilder = (ctx: StepContext) => TestEvent;
@@ -529,8 +574,23 @@ interface ComputePropertiesStep {
 interface DebugAssignmentsStep {
   type: EventsStepType.Debug;
   userId?: string;
+  description?: string;
+  queries?: ((
+    ctx: StepContext,
+    qb: ClickHouseQueryBuilder,
+  ) => {
+    query: string;
+    name: string;
+  })[];
 }
 
+// Wait in real time
+interface DelayStep {
+  type: EventsStepType.Delay;
+  timeMs: number;
+}
+
+// Wait in test time
 interface SleepStep {
   type: EventsStepType.Sleep;
   timeMs: number;
@@ -551,6 +611,9 @@ interface AssertStep {
   type: EventsStepType.Assert;
   description?: string;
   users?: (TableUser | ((ctx: StepContext) => TableUser))[];
+  verifyUsersSearch?: (
+    ctx: StepContext,
+  ) => Omit<GetUsersRequest, "workspaceId">;
   userCount?: number;
   userPropertyUserCount?: number;
   states?: (TestState | ((ctx: StepContext) => TestState))[];
@@ -561,10 +624,17 @@ interface AssertStep {
     | TestIndexedState
     | ((ctx: StepContext) => TestIndexedState)
   )[];
+  clickhouseCounts?: Partial<ClickhouseCounters>;
 }
 
 type TestUserProperty = Pick<UserPropertyResource, "name" | "definition">;
 type TestSegment = Pick<SegmentResource, "name" | "definition">;
+type TestJourneyResource = Pick<SavedJourneyResource, "name" | "definition">;
+type TestSubscriptionGroup = Pick<
+  SavedSubscriptionGroupResource,
+  "name" | "channel" | "type"
+>;
+
 interface TestJourney {
   name: string;
   entrySegmentName: string;
@@ -572,8 +642,22 @@ interface TestJourney {
 
 interface UpdateComputedPropertyStep {
   type: EventsStepType.UpdateComputedProperty;
+  updater?: (ctx: StepContext) => {
+    userProperties?: TestUserProperty[];
+    segments?: TestSegment[];
+    subscriptionGroups?: TestSubscriptionGroup[];
+  };
   userProperties?: TestUserProperty[];
   segments?: TestSegment[];
+  subscriptionGroups?: TestSubscriptionGroup[];
+}
+
+interface UpdateJourneyStep {
+  type: EventsStepType.UpdateJourney;
+  journeys: (
+    | TestJourneyResource
+    | ((ctx: StepContext) => TestJourneyResource)
+  )[];
 }
 
 type TableStep =
@@ -583,31 +667,142 @@ type TableStep =
   | AssertStep
   | SleepStep
   | DebugAssignmentsStep
-  | UpdateComputedPropertyStep;
+  | UpdateComputedPropertyStep
+  | DelayStep
+  | UpdateJourneyStep;
 
 interface TableTest {
   description: string;
   skip?: true;
   only?: true;
   userProperties?: TestUserProperty[];
+  subscriptionGroups?: TestSubscriptionGroup[];
   segments?: TestSegment[];
   journeys?: TestJourney[];
   steps: TableStep[];
+}
+
+async function runComputePropertiesIncrementalWithCounters({
+  args,
+  counters,
+}: {
+  args: ComputePropertiesArgs;
+  counters: ClickhouseCounters;
+}): Promise<void> {
+  let computation: Promise<void> | undefined;
+
+  jest.isolateModules(() => {
+    const actualClickhouse = jest.requireActual(
+      "../clickhouse",
+    ) as typeof import("../clickhouse");
+
+    jest.doMock("../clickhouse", () => ({
+      ...actualClickhouse,
+      command: (
+        ...commandArgs: Parameters<typeof actualClickhouse.command>
+      ) => {
+        counters.commands += 1;
+        const [params, options] = commandArgs;
+        counters.commandCalls.push({
+          params,
+          options: sanitizeOptions(options),
+        });
+        return actualClickhouse.command(...commandArgs);
+      },
+      query: (...queryArgs: Parameters<typeof actualClickhouse.query>) => {
+        counters.queries += 1;
+        const [params, options] = queryArgs;
+        counters.queryCalls.push({
+          params,
+          options: sanitizeOptions(options),
+        });
+        return actualClickhouse.query(...queryArgs);
+      },
+    }));
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const workflow =
+      require("./computePropertiesWorkflow/activities/computeProperties") as typeof import("./computePropertiesWorkflow/activities/computeProperties");
+    computation = workflow.computePropertiesIncremental(args);
+  });
+
+  if (!computation) {
+    throw new Error("computePropertiesIncremental failed to initialize");
+  }
+
+  jest.dontMock("../clickhouse");
+
+  try {
+    await computation;
+  } finally {
+    jest.resetModules();
+  }
+}
+
+async function upsertJourneys({
+  workspaceId,
+  now,
+  journeys,
+  context,
+}: {
+  workspaceId: string;
+  journeys: (
+    | TestJourneyResource
+    | ((ctx: StepContext) => TestJourneyResource)
+  )[];
+  now: number;
+  context: StepContext;
+}): Promise<SavedHasStartedJourneyResource[]> {
+  await Promise.all(
+    journeys.map((j) => {
+      const resource = typeof j === "function" ? j(context) : j;
+      return upsert({
+        table: schema.journey,
+        target: [schema.journey.workspaceId, schema.journey.name],
+        values: {
+          id: randomUUID(),
+          workspaceId,
+          name: resource.name,
+          status: "Running",
+          definition: resource.definition,
+          createdAt: new Date(now),
+          updatedAt: new Date(now),
+        },
+        set: {
+          updatedAt: new Date(now),
+        },
+      });
+    }),
+  );
+  const journeyModels = await db()
+    .select()
+    .from(schema.journey)
+    .where(eq(schema.journey.workspaceId, workspaceId));
+  return journeyModels.map((j) => {
+    const resource = unwrap(toJourneyResource(j));
+    if (resource.status === "NotStarted") {
+      throw new Error("journey should have been started");
+    }
+    return resource;
+  });
 }
 
 async function upsertComputedProperties({
   workspaceId,
   segments,
   userProperties,
+  subscriptionGroups,
   now,
 }: {
   workspaceId: string;
   segments: TestSegment[];
   userProperties: TestUserProperty[];
+  subscriptionGroups: TestSubscriptionGroup[];
   now: number;
 }): Promise<{
   segments: SavedSegmentResource[];
   userProperties: SavedUserPropertyResource[];
+  subscriptionGroups: SavedSubscriptionGroupResource[];
 }> {
   await Promise.all([
     ...userProperties.map((up) =>
@@ -650,17 +845,33 @@ async function upsertComputedProperties({
         },
       }),
     ),
+    ...subscriptionGroups.map((sg) =>
+      upsertSubscriptionGroup({
+        id: randomUUID(),
+        workspaceId,
+        name: sg.name,
+        type: sg.type,
+        channel: sg.channel,
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      }),
+    ),
   ]);
-  const [segmentModels, userPropertyModels] = await Promise.all([
-    db()
-      .select()
-      .from(schema.segment)
-      .where(eq(schema.segment.workspaceId, workspaceId)),
-    db()
-      .select()
-      .from(schema.userProperty)
-      .where(eq(schema.userProperty.workspaceId, workspaceId)),
-  ]);
+  const [segmentModels, userPropertyModels, subscriptionGroupModels] =
+    await Promise.all([
+      db()
+        .select()
+        .from(schema.segment)
+        .where(eq(schema.segment.workspaceId, workspaceId)),
+      db()
+        .select()
+        .from(schema.userProperty)
+        .where(eq(schema.userProperty.workspaceId, workspaceId)),
+      db()
+        .select()
+        .from(schema.subscriptionGroup)
+        .where(eq(schema.subscriptionGroup.workspaceId, workspaceId)),
+    ]);
   const segmentResources = segmentModels.map((s) =>
     unwrap(toSegmentResource(s)),
   );
@@ -668,9 +879,13 @@ async function upsertComputedProperties({
   const userPropertyResources = userPropertyModels.map((up) =>
     unwrap(toSavedUserPropertyResource(up)),
   );
+  const subscriptionGroupResources = subscriptionGroupModels.map((sg) =>
+    subscriptionGroupToResource(sg),
+  );
   return {
     segments: segmentResources,
     userProperties: userPropertyResources,
+    subscriptionGroups: subscriptionGroupResources,
   };
 }
 
@@ -707,6 +922,542 @@ describe("computeProperties", () => {
               traits: {
                 email: "test@email.com",
               },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          users: [
+            {
+              id: "user-1",
+              properties: {
+                email: "test@email.com",
+                id: "user-1",
+              },
+            },
+          ],
+          states: [
+            {
+              userId: "user-1",
+              type: "user_property",
+              lastValue: "test@email.com",
+              name: "email",
+            },
+          ],
+        },
+      ],
+    },
+    {
+      description:
+        "prunes a trait user property from recomputation when no events are received",
+      userProperties: [
+        {
+          name: "email",
+          definition: {
+            type: UserPropertyDefinitionType.Trait,
+            path: "email",
+          },
+        },
+      ],
+      segments: [],
+      steps: [
+        {
+          // ensure next period bound is after created at date of user property
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                email: "test@email.com",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description: "computes user property correctly initially",
+          users: [
+            {
+              id: "user-1",
+              properties: {
+                email: "test@email.com",
+                id: "user-1",
+              },
+            },
+          ],
+          states: [
+            {
+              userId: "user-1",
+              type: "user_property",
+              lastValue: "test@email.com",
+              name: "email",
+            },
+          ],
+          clickhouseCounts: {
+            commands: 2,
+          },
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "does not recompute a trait user property when no events are received",
+          clickhouseCounts: {
+            commands: 2,
+          },
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                unrelatedTrait: "unrelated",
+              },
+            },
+            {
+              type: EventType.Track,
+              offsetMs: -100,
+              userId: "user-1",
+              event: "test",
+              properties: {
+                email: "test@email.com",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "does not recompute a trait user property when the received events don't match the user property path or event type",
+          clickhouseCounts: {
+            commands: 2,
+          },
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                email: "test2@email.com",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "recomputes a trait user property when the received events match the user property path or event type",
+          clickhouseCounts: {
+            commands: 4,
+          },
+          users: [
+            {
+              id: "user-1",
+              properties: {
+                email: "test2@email.com",
+                id: "user-1",
+              },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      description:
+        "prunes an anyof trait user property from recomputation when no events are received",
+      userProperties: [
+        {
+          name: "email",
+          definition: {
+            type: UserPropertyDefinitionType.Group,
+            entry: "1",
+            nodes: [
+              {
+                type: UserPropertyDefinitionType.AnyOf,
+                id: "1",
+                children: ["2", "3"],
+              },
+              {
+                type: UserPropertyDefinitionType.Trait,
+                id: "2",
+                path: "email1",
+              },
+              {
+                type: UserPropertyDefinitionType.Trait,
+                id: "3",
+                path: "email2",
+              },
+            ],
+          },
+        },
+      ],
+      segments: [],
+      steps: [
+        {
+          // ensure next period bound is after created at date of user property
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                email1: "test@email.com",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description: "computes user property correctly initially",
+          users: [
+            {
+              id: "user-1",
+              properties: {
+                email: "test@email.com",
+                id: "user-1",
+              },
+            },
+          ],
+          clickhouseCounts: {
+            commands: 3,
+          },
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "does not recompute an anyof trait user property when no events are received",
+          clickhouseCounts: {
+            commands: 3,
+          },
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                unrelatedTrait: "unrelated",
+              },
+            },
+            {
+              type: EventType.Track,
+              offsetMs: -100,
+              userId: "user-1",
+              event: "test",
+              properties: {
+                email1: "test@email.com",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "does not recompute an anyof trait user property when the received events don't match the user property path or event type",
+          clickhouseCounts: {
+            commands: 3,
+          },
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                email1: "test2@email.com",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "recomputes an anyof trait user property when the received events match the user property path or event type",
+          clickhouseCounts: {
+            commands: 5,
+          },
+          users: [
+            {
+              id: "user-1",
+              properties: {
+                email: "test2@email.com",
+                id: "user-1",
+              },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      description:
+        "prunes a grouped trait segment from recomputation when no events are received",
+      userProperties: [],
+      segments: [
+        {
+          name: "andSegment",
+          definition: {
+            entryNode: {
+              type: SegmentNodeType.And,
+              id: "1",
+              children: ["2", "3"],
+            },
+            nodes: [
+              {
+                type: SegmentNodeType.Trait,
+                id: "2",
+                path: "env",
+                operator: {
+                  type: SegmentOperatorType.Equals,
+                  value: "test",
+                },
+              },
+              {
+                type: SegmentNodeType.Trait,
+                id: "3",
+                path: "status",
+                operator: {
+                  type: SegmentOperatorType.Equals,
+                  value: "running",
+                },
+              },
+            ],
+          },
+        },
+      ],
+      steps: [
+        {
+          // ensure next period bound is after created at date of user property
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                env: "test",
+                status: "running",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description: "computes grouped trait segment correctly initially",
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                andSegment: true,
+              },
+            },
+          ],
+          clickhouseCounts: {
+            commands: 5,
+          },
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "does not recompute a grouped trait segment when no events are received",
+          clickhouseCounts: {
+            commands: 5,
+          },
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                unrelatedTrait: "unrelated",
+              },
+            },
+            {
+              type: EventType.Track,
+              offsetMs: -100,
+              userId: "user-1",
+              event: "test",
+              properties: {
+                env: "prod",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "does not recompute a grouped trait segment when the received events don't match the user property path or event type",
+          clickhouseCounts: {
+            commands: 5,
+          },
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                env: "test",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "recomputes grouped trait segment when the received events match the user property path or event type",
+          clickhouseCounts: {
+            commands: 8,
+          },
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                andSegment: true,
+              },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      description: "computes a trait user property with concurrent empty event",
+      userProperties: [
+        {
+          name: "email",
+          definition: {
+            type: UserPropertyDefinitionType.Trait,
+            path: "email",
+          },
+        },
+        {
+          name: "id",
+          definition: {
+            type: UserPropertyDefinitionType.Id,
+          },
+        },
+      ],
+      segments: [],
+      steps: [
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                email: "test@email.com",
+              },
+            },
+            {
+              type: EventType.Identify,
+              offsetMs: -50,
+              userId: "user-1",
+              traits: {},
             },
           ],
         },
@@ -900,15 +1651,15 @@ describe("computeProperties", () => {
           periods: [
             {
               to: 0,
-              step: ComputedPropertyStep.ComputeState,
+              step: ComputedPropertyStepEnum.ComputeState,
             },
             {
               to: 0,
-              step: ComputedPropertyStep.ComputeAssignments,
+              step: ComputedPropertyStepEnum.ComputeAssignments,
             },
             {
               to: 0,
-              step: ComputedPropertyStep.ProcessAssignments,
+              step: ComputedPropertyStepEnum.ProcessAssignments,
             },
           ],
         },
@@ -956,30 +1707,30 @@ describe("computeProperties", () => {
           periods: [
             {
               to: -1000,
-              step: ComputedPropertyStep.ComputeState,
+              step: ComputedPropertyStepEnum.ComputeState,
             },
             {
               to: -1000,
-              step: ComputedPropertyStep.ComputeAssignments,
+              step: ComputedPropertyStepEnum.ComputeAssignments,
             },
             {
               to: -1000,
-              step: ComputedPropertyStep.ProcessAssignments,
+              step: ComputedPropertyStepEnum.ProcessAssignments,
             },
             {
               from: -1000,
               to: 0,
-              step: ComputedPropertyStep.ComputeState,
+              step: ComputedPropertyStepEnum.ComputeState,
             },
             {
               from: -1000,
               to: 0,
-              step: ComputedPropertyStep.ComputeAssignments,
+              step: ComputedPropertyStepEnum.ComputeAssignments,
             },
             {
               from: -1000,
               to: 0,
-              step: ComputedPropertyStep.ProcessAssignments,
+              step: ComputedPropertyStepEnum.ProcessAssignments,
             },
           ],
         },
@@ -2211,6 +2962,108 @@ describe("computeProperties", () => {
       ],
     },
     {
+      description: "computes absolute timestamp operator trait segment",
+      userProperties: [],
+      segments: [],
+      steps: [
+        {
+          type: EventsStepType.UpdateComputedProperty,
+          updater: (ctx) => {
+            return {
+              segments: [
+                {
+                  name: "newUsers",
+                  definition: {
+                    entryNode: {
+                      type: SegmentNodeType.Trait,
+                      id: "1",
+                      path: "createdAt",
+                      operator: {
+                        type: SegmentOperatorType.AbsoluteTimestamp,
+                        absoluteTimestamp: new Date(
+                          // 5 hours from now
+                          ctx.now + 1000 * 60 * 60 * 5,
+                        ).toISOString(),
+                        direction: CursorDirectionEnum.After,
+                      },
+                    },
+                    nodes: [],
+                  },
+                },
+              ],
+            };
+          },
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            ({ now }) => ({
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                createdAt: new Date(now - 100).toISOString(),
+              },
+            }),
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description: "first user is not in the segment",
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                newUsers: null,
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.Sleep,
+          // 7 hours from now
+          timeMs: 1000 * 60 * 60 * 7,
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            ({ now }) => ({
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-2",
+              traits: {
+                createdAt: new Date(now - 100).toISOString(),
+              },
+            }),
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description: "next user is in the segment",
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                newUsers: null,
+              },
+            },
+            {
+              id: "user-2",
+              segments: {
+                newUsers: true,
+              },
+            },
+          ],
+        },
+      ],
+    },
+    {
       description: "computes grouped within operator trait segment",
       userProperties: [],
       segments: [
@@ -3249,6 +4102,82 @@ describe("computeProperties", () => {
               id: "user-3",
               segments: {
                 performed: null,
+              },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      description: "performed segment with whitespace in event name",
+      userProperties: [
+        {
+          name: "id",
+          definition: {
+            type: UserPropertyDefinitionType.Id,
+          },
+        },
+        {
+          name: "email",
+          definition: {
+            type: UserPropertyDefinitionType.Trait,
+            path: "email",
+          },
+        },
+      ],
+      segments: [
+        {
+          name: "performed",
+          definition: {
+            entryNode: {
+              type: SegmentNodeType.Performed,
+              id: "1",
+              event: "test event name",
+              timesOperator: RelationalOperators.GreaterThanOrEqual,
+              times: 2,
+            },
+            nodes: [],
+          },
+        },
+      ],
+      steps: [
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Track,
+              offsetMs: -150,
+              userId: "user-1",
+              event: "test event name",
+            },
+            {
+              type: EventType.Track,
+              offsetMs: -100,
+              userId: "user-1",
+              event: "test event name",
+            },
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                email: "test1@email.com",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "includes user who performed test event twice, but excludes user who performed test event once, and user who performed unrelated event",
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                performed: true,
               },
             },
           ],
@@ -4571,6 +5500,12 @@ describe("computeProperties", () => {
               offsetMs: -100,
               traits: {},
             },
+            {
+              type: EventType.Identify,
+              userId: "user-4",
+              offsetMs: -100,
+              traits: {},
+            },
           ],
         },
         {
@@ -4578,6 +5513,8 @@ describe("computeProperties", () => {
         },
         {
           type: EventsStepType.Assert,
+          description:
+            "the not exists segments should be calculated correctly initially",
           users: [
             {
               id: "user-1",
@@ -4595,6 +5532,161 @@ describe("computeProperties", () => {
               id: "user-3",
               segments: {
                 emailNotExists: true,
+              },
+            },
+            {
+              id: "user-4",
+              segments: {
+                emailNotExists: true,
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.UpdateComputedProperty,
+          segments: [
+            {
+              name: "emailNotExists",
+              definition: {
+                entryNode: {
+                  type: SegmentNodeType.Trait,
+                  // Make a change that should not be impactful, other than updating the state ids
+                  id: "2",
+                  path: "email",
+                  operator: {
+                    type: SegmentOperatorType.NotExists,
+                  },
+                },
+                nodes: [],
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              userId: "user-3",
+              offsetMs: -100,
+              traits: {
+                email: "test3@email.com",
+              },
+            },
+            {
+              type: EventType.Identify,
+              userId: "user-4",
+              offsetMs: -100,
+              traits: {
+                email: "test4@email.com",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "the not exists segments should be calculated correctly after making a no-op update to the segment definition submitting a user event and recomputing",
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                emailNotExists: null,
+              },
+            },
+            {
+              id: "user-2",
+              segments: {
+                emailNotExists: true,
+              },
+            },
+            {
+              id: "user-3",
+              segments: {
+                emailNotExists: null,
+              },
+            },
+            {
+              id: "user-4",
+              segments: {
+                emailNotExists: null,
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              userId: "user-2",
+              offsetMs: -100,
+              traits: {
+                email: "test2@email.com",
+              },
+            },
+            {
+              type: EventType.Identify,
+              userId: "user-4",
+              offsetMs: -100,
+              traits: {
+                unrelated: "value",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "when a users trait value is updated with a present value, the users should be removed from the not exists segment",
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                emailNotExists: null,
+              },
+            },
+            {
+              id: "user-2",
+              segments: {
+                emailNotExists: null,
+              },
+            },
+            {
+              id: "user-3",
+              segments: {
+                emailNotExists: null,
+              },
+            },
+            {
+              id: "user-4",
+              segments: {
+                emailNotExists: null,
               },
             },
           ],
@@ -5395,6 +6487,73 @@ describe("computeProperties", () => {
             },
           ],
         },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.UpdateComputedProperty,
+          segments: [
+            {
+              name: "manual",
+              definition: {
+                entryNode: {
+                  type: SegmentNodeType.Manual,
+                  id: "1",
+                  version: 2,
+                },
+                nodes: [],
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            ({ segments }) => ({
+              type: EventType.Track,
+              userId: "user-2",
+              event: InternalEventType.ManualSegmentUpdate,
+              offsetMs: -100,
+              properties: {
+                segmentId: segments[0]?.id,
+                version: 2,
+                inSegment: 1,
+              },
+            }),
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          // allow async delete to propagate
+          type: EventsStepType.Delay,
+          timeMs: 5000,
+        },
+        {
+          type: EventsStepType.Assert,
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                manual: null,
+              },
+            },
+            {
+              id: "user-2",
+              segments: {
+                manual: true,
+              },
+            },
+            {
+              id: "user-3",
+              segments: {
+                manual: null,
+              },
+            },
+          ],
+        },
       ],
     },
     {
@@ -5837,21 +6996,20 @@ describe("computeProperties", () => {
     },
     {
       description: "with an opt out subscription group segment",
-      segments: [
+      subscriptionGroups: [
         {
           name: "optOut",
-          definition: {
-            entryNode: {
-              type: SegmentNodeType.SubscriptionGroup,
-              id: "1",
-              subscriptionGroupId: "subscription-group-id",
-              subscriptionGroupType: SubscriptionGroupType.OptOut,
-            },
-            nodes: [],
-          },
+          channel: ChannelType.Email,
+          type: SubscriptionGroupType.OptOut,
         },
       ],
       userProperties: [
+        {
+          name: "id",
+          definition: {
+            type: UserPropertyDefinitionType.Id,
+          },
+        },
         {
           name: "email",
           definition: {
@@ -5883,11 +7041,15 @@ describe("computeProperties", () => {
           users: [
             {
               id: "user-1",
-              segments: {
-                optOut: null,
+              subscriptions: {
+                optOut: true,
               },
             },
           ],
+          verifyUsersSearch: (ctx) => ({
+            subscriptionGroupFilter: [ctx.subscriptionGroups[0]!.id],
+            includeSubscriptions: true,
+          }),
         },
         {
           type: EventsStepType.Sleep,
@@ -5896,16 +7058,17 @@ describe("computeProperties", () => {
         {
           type: EventsStepType.SubmitEvents,
           events: [
-            {
-              offsetMs: -100,
-              userId: "user-1",
-              type: EventType.Track,
-              event: InternalEventType.SubscriptionChange,
-              properties: {
-                subscriptionId: "subscription-group-id",
-                action: SubscriptionChange.Unsubscribe,
-              },
-            } satisfies TestEvent & SubscriptionChangeEvent,
+            (ctx) =>
+              ({
+                offsetMs: -100,
+                userId: "user-1",
+                type: EventType.Track,
+                event: InternalEventType.SubscriptionChange,
+                properties: {
+                  subscriptionId: ctx.subscriptionGroups[0]?.id ?? "",
+                  action: SubscriptionChange.Unsubscribe,
+                },
+              }) satisfies TestEvent & SubscriptionChangeEvent,
           ],
         },
         {
@@ -5917,8 +7080,8 @@ describe("computeProperties", () => {
           users: [
             {
               id: "user-1",
-              segments: {
-                optOut: null,
+              subscriptions: {
+                optOut: false,
               },
             },
           ],
@@ -5930,16 +7093,17 @@ describe("computeProperties", () => {
         {
           type: EventsStepType.SubmitEvents,
           events: [
-            {
-              offsetMs: -100,
-              userId: "user-1",
-              type: EventType.Track,
-              event: InternalEventType.SubscriptionChange,
-              properties: {
-                subscriptionId: "subscription-group-id",
-                action: SubscriptionChange.Subscribe,
-              },
-            } satisfies TestEvent & SubscriptionChangeEvent,
+            (ctx) =>
+              ({
+                offsetMs: -100,
+                userId: "user-1",
+                type: EventType.Track,
+                event: InternalEventType.SubscriptionChange,
+                properties: {
+                  subscriptionId: ctx.subscriptionGroups[0]?.id ?? "",
+                  action: SubscriptionChange.Subscribe,
+                },
+              }) satisfies TestEvent & SubscriptionChangeEvent,
           ],
         },
         {
@@ -5951,7 +7115,7 @@ describe("computeProperties", () => {
           users: [
             {
               id: "user-1",
-              segments: {
+              subscriptions: {
                 optOut: true,
               },
             },
@@ -6052,6 +7216,61 @@ describe("computeProperties", () => {
                     prop2: "value2",
                     prop3: ["value3", "value4"],
                   },
+                },
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          users: [
+            {
+              id: "user-1",
+              properties: {
+                complex: {
+                  prop1: "value1",
+                  obj2: {
+                    prop2: "value2",
+                    prop3: ["value3", "value4"],
+                  },
+                },
+              },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      description:
+        "with a performed user property with a flat complex inner structure",
+      userProperties: [
+        {
+          name: "complex",
+          definition: {
+            type: UserPropertyDefinitionType.Performed,
+            event: "test",
+            path: "$",
+          },
+        },
+      ],
+      segments: [],
+      steps: [
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              userId: "user-1",
+              offsetMs: -100,
+              type: EventType.Track,
+              event: "test",
+              properties: {
+                prop1: "value1",
+                obj2: {
+                  prop2: "value2",
+                  prop3: ["value3", "value4"],
                 },
               },
             },
@@ -6212,6 +7431,11 @@ describe("computeProperties", () => {
           type: EventsStepType.ComputeProperties,
         },
         {
+          // allow async delete to propagate
+          type: EventsStepType.Delay,
+          timeMs: 5000,
+        },
+        {
           type: EventsStepType.Assert,
           description:
             "user is no longer in the segment after its definition is updated",
@@ -6326,6 +7550,11 @@ describe("computeProperties", () => {
           type: EventsStepType.ComputeProperties,
         },
         {
+          // allow async delete to propagate
+          type: EventsStepType.Delay,
+          timeMs: 5000,
+        },
+        {
           type: EventsStepType.Assert,
           description: "user property is empty after its definition is updated",
           users: [
@@ -6402,6 +7631,11 @@ describe("computeProperties", () => {
         },
         {
           type: EventsStepType.ComputeProperties,
+        },
+        {
+          // allow async delete to propagate
+          type: EventsStepType.Delay,
+          timeMs: 5000,
         },
         {
           type: EventsStepType.Assert,
@@ -6715,6 +7949,11 @@ describe("computeProperties", () => {
           type: EventsStepType.ComputeProperties,
         },
         {
+          // allow async deletes to propagate
+          type: EventsStepType.Delay,
+          timeMs: 5000,
+        },
+        {
           type: EventsStepType.Assert,
           description:
             "user is no longer in the segment after its definition is updated",
@@ -6763,6 +8002,121 @@ describe("computeProperties", () => {
               id: "user-1",
               segments: {
                 updatedPerformed: true,
+              },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      description: "computes an includes segment",
+      segments: [
+        {
+          name: "includes",
+          definition: {
+            entryNode: {
+              type: SegmentNodeType.Includes,
+              id: "1",
+              item: "test2",
+              path: "items1",
+            },
+            nodes: [],
+          },
+        },
+      ],
+      steps: [
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                items1: ["test1", "test2", "test3"],
+              },
+            },
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-2",
+              traits: {
+                items1: ["test4", "test5", "test6"],
+              },
+            },
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-3",
+              traits: {
+                items2: ["test1", "test2", "test3"],
+              },
+            },
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-4",
+              traits: {
+                items1: "invalid",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                includes: true,
+              },
+            },
+            {
+              id: "user-2",
+              segments: {
+                includes: null,
+              },
+            },
+            {
+              id: "user-3",
+              segments: {
+                includes: null,
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                items1: [],
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "user is no longer in the segment after its array is updated",
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                includes: null,
               },
             },
           ],
@@ -7098,24 +8452,11 @@ describe("computeProperties", () => {
           name: "anonymousId",
         },
       ],
-      segments: [
+      subscriptionGroups: [
         {
           name: "optIn",
-          definition: {
-            entryNode: {
-              type: SegmentNodeType.SubscriptionGroup,
-              id: "1",
-              subscriptionGroupId: "subscription-group-id",
-              subscriptionGroupType: SubscriptionGroupType.OptIn,
-            },
-            nodes: [],
-          },
-        },
-      ],
-      journeys: [
-        {
-          name: "optInAnonymous",
-          entrySegmentName: "optIn",
+          type: SubscriptionGroupType.OptIn,
+          channel: ChannelType.Email,
         },
       ],
       steps: [
@@ -7141,8 +8482,8 @@ describe("computeProperties", () => {
           users: [
             {
               id: "user-1",
-              segments: {
-                optIn: null,
+              subscriptions: {
+                optIn: false,
               },
             },
           ],
@@ -7154,16 +8495,17 @@ describe("computeProperties", () => {
         {
           type: EventsStepType.SubmitEvents,
           events: [
-            {
-              offsetMs: -100,
-              anonymousId: "user-1",
-              type: EventType.Track,
-              event: InternalEventType.SubscriptionChange,
-              properties: {
-                subscriptionId: "subscription-group-id",
-                action: SubscriptionChange.Subscribe,
-              },
-            } satisfies TestEvent & SubscriptionChangeEvent,
+            (ctx) =>
+              ({
+                offsetMs: -100,
+                anonymousId: "user-1",
+                type: EventType.Track,
+                event: InternalEventType.SubscriptionChange,
+                properties: {
+                  subscriptionId: ctx.subscriptionGroups[0]?.id ?? "",
+                  action: SubscriptionChange.Subscribe,
+                },
+              }) satisfies TestEvent & SubscriptionChangeEvent,
           ],
         },
         {
@@ -7175,14 +8517,157 @@ describe("computeProperties", () => {
           users: [
             {
               id: "user-1",
-              segments: {
+              subscriptions: {
                 optIn: true,
               },
             },
           ],
+        },
+      ],
+    },
+    {
+      description: "retroactively signals a segment entry journey",
+      userProperties: [
+        {
+          name: "id",
+          definition: {
+            type: UserPropertyDefinitionType.Id,
+          },
+        },
+      ],
+      segments: [
+        {
+          name: "isMax",
+          definition: {
+            entryNode: {
+              type: SegmentNodeType.Trait,
+              id: "1",
+              path: "firstName",
+              operator: {
+                type: SegmentOperatorType.Equals,
+                value: "Max",
+              },
+            },
+            nodes: [],
+          },
+        },
+      ],
+      steps: [
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                firstName: "Max",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "user is in the segment prior to the journey being created",
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                isMax: true,
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.UpdateJourney,
+          journeys: [
+            (ctx) => ({
+              name: "isMaxJourney",
+              definition: {
+                entryNode: {
+                  type: JourneyNodeType.SegmentEntryNode,
+                  segment: ctx.segments.find((s) => s.name === "isMax")!.id,
+                  child: JourneyNodeType.ExitNode,
+                },
+                nodes: [],
+                exitNode: {
+                  type: JourneyNodeType.ExitNode,
+                },
+              },
+            }),
+          ],
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 3 * 24 * 60 * 60 * 1000,
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "journey signals for segment which has undergone several compute property periods before journey was created",
           journeys: [
             {
-              journeyName: "optInAnonymous",
+              journeyName: "isMaxJourney",
+              times: 1,
+            },
+          ],
+        },
+        {
+          type: EventsStepType.UpdateJourney,
+          journeys: [
+            (ctx) => ({
+              name: "otherIsMaxJourney",
+              definition: {
+                entryNode: {
+                  type: JourneyNodeType.SegmentEntryNode,
+                  segment: ctx.segments.find((s) => s.name === "isMax")!.id,
+                  child: JourneyNodeType.ExitNode,
+                },
+                nodes: [],
+                exitNode: {
+                  type: JourneyNodeType.ExitNode,
+                },
+              },
+            }),
+          ],
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 3 * 24 * 60 * 60 * 1000,
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          journeys: [
+            {
+              journeyName: "isMaxJourney",
+              times: 1,
+            },
+            {
+              journeyName: "otherIsMaxJourney",
               times: 1,
             },
           ],
@@ -7204,6 +8689,13 @@ describe("computeProperties", () => {
 
     let now = Date.now();
 
+    const clickhouseCounters: ClickhouseCounters = {
+      commands: 0,
+      queries: 0,
+      commandCalls: [],
+      queryCalls: [],
+    };
+
     const [workspace] = await db()
       .insert(schema.workspace)
       .values({
@@ -7219,15 +8711,17 @@ describe("computeProperties", () => {
 
     const workspaceId = workspace.id;
 
-    let { userProperties, segments } = await upsertComputedProperties({
-      workspaceId,
-      userProperties: test.userProperties ?? [],
-      segments: test.segments ?? [],
-      now,
-    });
+    let { userProperties, segments, subscriptionGroups } =
+      await upsertComputedProperties({
+        workspaceId,
+        userProperties: test.userProperties ?? [],
+        segments: test.segments ?? [],
+        subscriptionGroups: test.subscriptionGroups ?? [],
+        now,
+      });
 
-    const journeys = await Promise.all(
-      test.journeys?.map(({ name, entrySegmentName }) => {
+    let journeys: SavedHasStartedJourneyResource[] = await Promise.all(
+      test.journeys?.map(async ({ name, entrySegmentName }) => {
         const segment = segments.find((s) => s.name === entrySegmentName);
         if (!segment) {
           throw new Error(
@@ -7245,7 +8739,7 @@ describe("computeProperties", () => {
             type: JourneyNodeType.ExitNode,
           },
         };
-        return insert({
+        const journeyModel = await insert({
           table: schema.journey,
           values: {
             id: randomUUID(),
@@ -7257,16 +8751,12 @@ describe("computeProperties", () => {
             createdAt: new Date(now),
           },
         }).then(unwrap);
-      }) ?? [],
-    );
-    const journeyResources: SavedHasStartedJourneyResource[] = journeys.map(
-      (j) => {
-        const resource = unwrap(toJourneyResource(j));
+        const resource = unwrap(toJourneyResource(journeyModel));
         if (resource.status === "NotStarted") {
           throw new Error("journey should have been started");
         }
         return resource;
-      },
+      }) ?? [],
     );
 
     for (const step of test.steps) {
@@ -7274,6 +8764,8 @@ describe("computeProperties", () => {
         workspace,
         segments,
         now,
+        clickhouseCounters,
+        subscriptionGroups,
       };
       switch (step.type) {
         case EventsStepType.SubmitEvents: {
@@ -7326,31 +8818,68 @@ describe("computeProperties", () => {
           break;
         }
         case EventsStepType.Debug: {
-          const [assignments, states, resolvedSegmentStates] =
-            await Promise.all([
-              readAssignments({ workspaceId }),
-              readDisaggregatedStates({ workspaceId }),
-              readResolvedSegmentStates({
-                workspaceId,
-              }),
-            ]);
+          const debugQueries = step.queries?.map(async (q) => {
+            const qb = new ClickHouseQueryBuilder();
+            const { query, name } = q(stepContext, qb);
+            const result = await clickhouseClient().query({
+              query,
+              query_params: qb.getQueries(),
+            });
+            const { data } = await result.json();
+            const values = {
+              name,
+              query,
+              data,
+            };
+            return values;
+          });
+          const [
+            assignments,
+            states,
+            resolvedSegmentStates,
+            periods,
+            updatedComputedPropertyState,
+            debugQueryData,
+          ] = await Promise.all([
+            readAssignments({ workspaceId }),
+            readDisaggregatedStates({ workspaceId }),
+            readResolvedSegmentStates({
+              workspaceId,
+            }),
+            readPeriods({ workspaceId }),
+            readUpdatedComputedPropertyState({ workspaceId }),
+            Promise.all(debugQueries ?? []),
+          ]);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const logged: Record<string, any> = {
+            assignments: assignments.filter((a) =>
+              step.userId ? a.user_id === step.userId : true,
+            ),
+            states: states.filter((s) =>
+              step.userId ? s.user_id === step.userId : true,
+            ),
+            resolvedSegmentStates: resolvedSegmentStates.filter((s) =>
+              step.userId ? s.user_id === step.userId : true,
+            ),
+            updatedComputedPropertyState: updatedComputedPropertyState.filter(
+              (s) => (step.userId ? s.user_id === step.userId : true),
+            ),
+            periods,
+            stepContext,
+          };
+          for (const { name, query, data } of debugQueryData) {
+            logged[name] = {
+              query,
+              data,
+            };
+          }
           logger().warn(
-            {
-              assignments: assignments.filter((a) =>
-                step.userId ? a.user_id === step.userId : true,
-              ),
-              states: states.filter((s) =>
-                step.userId ? s.user_id === step.userId : true,
-              ),
-              resolvedSegmentStates: resolvedSegmentStates.filter((s) =>
-                step.userId ? s.user_id === step.userId : true,
-              ),
-            },
-            "debug clickhouse values",
+            logged,
+            `debug clickhouse values:${step.description ? ` ${step.description}` : ""}`,
           );
           break;
         }
-        case EventsStepType.ComputeProperties:
+        case EventsStepType.ComputeProperties: {
           logger().debug(
             {
               segments,
@@ -7358,27 +8887,19 @@ describe("computeProperties", () => {
             },
             "computeProperties step",
           );
-          await computeState({
-            workspaceId,
-            segments,
-            now,
-            userProperties,
-          });
-          await computeAssignments({
-            workspaceId,
-            segments,
-            userProperties,
-            now,
-          });
-          await processAssignments({
-            workspaceId,
-            segments,
-            integrations: [],
-            journeys: journeyResources,
-            userProperties,
-            now,
+          await runComputePropertiesIncrementalWithCounters({
+            args: {
+              workspaceId,
+              segments,
+              userProperties,
+              integrations: [],
+              journeys,
+              now,
+            },
+            counters: clickhouseCounters,
           });
           break;
+        }
         case EventsStepType.Sleep:
           now += step.timeMs;
           logger().debug(
@@ -7388,7 +8909,23 @@ describe("computeProperties", () => {
             "sleep step",
           );
           break;
+        case EventsStepType.Delay:
+          // eslint-disable-next-line no-promise-executor-return
+          await new Promise((resolve) => setTimeout(resolve, step.timeMs));
+          break;
         case EventsStepType.Assert: {
+          let usersToVerify: TableUser[] | null = null;
+          if (step.users && step.users.length > 0 && step.verifyUsersSearch) {
+            const result = unwrap(
+              await getUsers({
+                ...step.verifyUsersSearch(stepContext),
+                workspaceId,
+              }),
+            );
+            usersToVerify = result.users.map((user) =>
+              toTableUser(stepContext, user),
+            );
+          }
           const usersAssertions =
             step.users?.map(async (userOrFn) => {
               let user: TableUser;
@@ -7402,7 +8939,7 @@ describe("computeProperties", () => {
                   ? findAllUserPropertyAssignments({
                       userId: user.id,
                       workspaceId,
-                    }).then((up) =>
+                    }).then((up) => {
                       expect(
                         // only check the user id if it's explicitly asserted
                         // upon, for convenience
@@ -7410,13 +8947,14 @@ describe("computeProperties", () => {
                         `${
                           step.description ? `${step.description}: ` : ""
                         }user properties for: ${user.id}`,
-                      ).toEqual(user.properties),
-                    )
+                      ).toEqual(user.properties);
+                    })
                   : null,
                 user.segments
                   ? findAllSegmentAssignments({
                       userId: user.id,
                       workspaceId,
+                      segmentIds: segments.map((s) => s.id),
                     }).then((s) => {
                       expect(
                         s,
@@ -7424,6 +8962,29 @@ describe("computeProperties", () => {
                           step.description ? `${step.description}: ` : ""
                         }segments for: ${user.id}`,
                       ).toEqual(user.segments);
+                    })
+                  : null,
+                user.subscriptions
+                  ? getUserSubscriptions({
+                      userId: user.id,
+                      workspaceId,
+                    }).then((s) => {
+                      for (const [sgName, sgValue] of Object.entries(
+                        user.subscriptions ?? [],
+                      )) {
+                        const actualSubscription = s.find(
+                          (sg) => sg.name === sgName,
+                        );
+                        if (!actualSubscription) {
+                          throw new Error(
+                            `subscription ${sgName} not found for user ${user.id}`,
+                          );
+                        }
+                        expect(
+                          actualSubscription.isSubscribed,
+                          `${step.description ? `${step.description}: ` : ""}subscription ${sgName} for: ${user.id}`,
+                        ).toEqual(sgValue);
+                      }
                     })
                   : null,
               ]);
@@ -7555,9 +9116,18 @@ describe("computeProperties", () => {
                   }
                   return s;
                 });
-                expect(simplifiedPeriods, step.description).toEqual(
-                  step.periods,
-                );
+                if (step.periods) {
+                  expect(
+                    simplifiedPeriods,
+                    "should have the same number of periods as expected",
+                  ).toHaveLength(step.periods.length);
+
+                  for (const expected of step.periods) {
+                    expect(simplifiedPeriods, step.description).toContainEqual(
+                      expected,
+                    );
+                  }
+                }
               })()
             : null;
           const resolvedSegmentStatesAssertions = step.resolvedSegmentStates
@@ -7614,8 +9184,45 @@ describe("computeProperties", () => {
           await userCountAssertion;
           await Promise.all(usersAssertions);
 
+          // Assert on users returned from getUsers if verifyUsersSearch was provided
+          if (usersToVerify !== null && step.users) {
+            const expectedUsers: TableUser[] = step.users.map((userOrFn) =>
+              typeof userOrFn === "function" ? userOrFn(stepContext) : userOrFn,
+            );
+
+            // Verify each expected user is found in usersToVerify
+            for (const expectedUser of expectedUsers) {
+              const actualUser = usersToVerify.find(
+                (u) => u.id === expectedUser.id,
+              );
+              expect(
+                actualUser,
+                `${step.description ? `${step.description}: ` : ""}expected user ${expectedUser.id} to be returned from getUsers`,
+              ).toBeDefined();
+
+              if (expectedUser.properties) {
+                expect(
+                  actualUser?.properties,
+                  `${step.description ? `${step.description}: ` : ""}properties from getUsers for: ${expectedUser.id}`,
+                ).toEqual(expectedUser.properties);
+              }
+              if (expectedUser.segments) {
+                expect(
+                  actualUser?.segments,
+                  `${step.description ? `${step.description}: ` : ""}segments from getUsers for: ${expectedUser.id}`,
+                ).toEqual(expectedUser.segments);
+              }
+              if (expectedUser.subscriptions) {
+                expect(
+                  actualUser?.subscriptions,
+                  `${step.description ? `${step.description}: ` : ""}subscriptions from getUsers for: ${expectedUser.id}`,
+                ).toEqual(expectedUser.subscriptions);
+              }
+            }
+          }
+
           for (const assertedJourney of step.journeys ?? []) {
-            const journey = journeyResources.find(
+            const journey = journeys.find(
               (j) => j.name === assertedJourney.journeyName,
             );
             if (!journey) {
@@ -7633,17 +9240,70 @@ describe("computeProperties", () => {
               expect(timesForJourney).toEqual(assertedJourney.times);
             }
           }
+          if (step.clickhouseCounts) {
+            const { commands, queries } = step.clickhouseCounts;
+            if (commands !== undefined) {
+              const message = buildClickhouseExpectationMessage({
+                description: step.description,
+                expected: commands,
+                actual: clickhouseCounters.commands,
+                type: "command",
+                calls: clickhouseCounters.commandCalls,
+              });
+              expect(clickhouseCounters.commands, message).toEqual(commands);
+            }
+            if (queries !== undefined) {
+              const message = buildClickhouseExpectationMessage({
+                description: step.description,
+                expected: queries,
+                actual: clickhouseCounters.queries,
+                type: "query",
+                calls: clickhouseCounters.queryCalls,
+              });
+              expect(clickhouseCounters.queries, message).toEqual(queries);
+            }
+          }
           break;
         }
         case EventsStepType.UpdateComputedProperty: {
+          let toUpdate: Required<
+            Pick<
+              UpdateComputedPropertyStep,
+              "userProperties" | "segments" | "subscriptionGroups"
+            >
+          >;
+          if (step.updater) {
+            const updaterResult = step.updater(stepContext);
+            toUpdate = {
+              userProperties: updaterResult.userProperties ?? [],
+              segments: updaterResult.segments ?? [],
+              subscriptionGroups: updaterResult.subscriptionGroups ?? [],
+            };
+          } else {
+            toUpdate = {
+              userProperties: step.userProperties ?? [],
+              segments: step.segments ?? [],
+              subscriptionGroups: step.subscriptionGroups ?? [],
+            };
+          }
+
           const computedProperties = await upsertComputedProperties({
             workspaceId,
             now,
-            userProperties: step.userProperties ?? [],
-            segments: step.segments ?? [],
+            ...toUpdate,
           });
           segments = computedProperties.segments;
           userProperties = computedProperties.userProperties;
+          subscriptionGroups = computedProperties.subscriptionGroups;
+          break;
+        }
+        case EventsStepType.UpdateJourney: {
+          journeys = await upsertJourneys({
+            workspaceId,
+            now,
+            journeys: step.journeys,
+            context: stepContext,
+          });
           break;
         }
         default:
