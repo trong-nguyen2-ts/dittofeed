@@ -69,6 +69,7 @@ import {
 import { SubtleHeader } from "../headers";
 import InfoTooltip from "../infoTooltip";
 import { SubscriptionGroupAutocompleteV2 } from "../subscriptionGroupAutocomplete";
+import { TimezoneAutocomplete } from "../timezoneAutocomplete";
 import findJourneyNode from "./findJourneyNode";
 import journeyNodeLabel from "./journeyNodeLabel";
 import { waitForTimeoutLabel } from "./store";
@@ -370,6 +371,7 @@ function EntryNodeFields({
             if (props.type !== AdditionalJourneyNodeType.EntryUiNode) {
               return;
             }
+            // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
             const type = e.target.value as EntryNode["type"];
             if (props.variant.type === type) {
               return;
@@ -463,6 +465,7 @@ function MessageNodeFields({
     updateJourneyNodeData(nodeId, (node) => {
       const props = node.data.nodeTypeProps;
       if (props.type === JourneyNodeType.MessageNode) {
+        // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
         const channel = e.target.value as ChannelType;
         const defaultSubscriptionGroup = getDefaultSubscriptionGroup({
           channel,
@@ -482,16 +485,19 @@ function MessageNodeFields({
         switch (props.channel) {
           case ChannelType.Email:
             props.providerOverride =
+              // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
               (provider as WorkspaceWideEmailProviders | null) ?? undefined;
             break;
           case ChannelType.Sms:
             props.providerOverride =
+              // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
               (provider as SmsProviderType | null) ?? undefined;
             break;
           case ChannelType.Webhook:
             break;
           case ChannelType.MobilePush:
             props.providerOverride =
+              // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
               (provider as MobilePushProviderType | null) ?? undefined;
             break;
         }
@@ -585,6 +591,7 @@ function MessageNodeFields({
           if (!event.target.value) {
             props.senderOverride = undefined;
           } else {
+            // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
             switch (event.target.value as TwilioSenderOverrideType) {
               case TwilioSenderOverrideType.MessageSid:
                 props.senderOverride = {
@@ -678,6 +685,7 @@ function MessageNodeFields({
           if (!event.target.value) {
             props.senderOverride = undefined;
           } else {
+            // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
             switch (event.target.value as SignalWireSenderOverrideType) {
               case SignalWireSenderOverrideType.PhoneNumber:
                 props.senderOverride = {
@@ -901,6 +909,7 @@ function DelayNodeFields({
         nodeVariant.allowedDaysOfWeek ?? DAY_INDICES,
       );
       const dayEls = DAYS.map((day, i) => {
+        // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
         const index = i as AllowedDayIndices;
         return (
           <Tooltip key={day.day} title={day.day}>
@@ -963,6 +972,26 @@ function DelayNodeFields({
           <SubtleHeader>Allowed Days of the Week</SubtleHeader>
           <Stack direction="row" spacing={1}>
             {dayEls}
+          </Stack>
+          <Stack direction="row" spacing={1} alignItems="center">
+            <TimezoneAutocomplete
+              value={nodeVariant.defaultTimezone}
+              disabled={disabled}
+              label="Default Timezone (Optional)"
+              handler={(timezone) => {
+                updateJourneyNodeData(nodeId, (node) => {
+                  const props = node.data.nodeTypeProps;
+                  if (
+                    props.type === JourneyNodeType.DelayNode &&
+                    props.variant.type === DelayVariantType.LocalTime
+                  ) {
+                    props.variant.defaultTimezone = timezone ?? undefined;
+                  }
+                });
+              }}
+              sx={{ flexGrow: 1 }}
+            />
+            <InfoTooltip title="Default timezone that local time will be expressed in, if a user's timezone cannot be inferred." />
           </Stack>
         </>
       );
@@ -1060,6 +1089,7 @@ function DelayNodeFields({
             if (props.type !== JourneyNodeType.DelayNode) {
               return;
             }
+            // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
             const type = e.target.value as DelayVariantType;
             if (props.variant.type === type) {
               return;
